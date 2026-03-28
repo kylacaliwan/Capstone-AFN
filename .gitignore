@@ -1,0 +1,7 @@
+.env
+backend/db.sqlite3
+backend/admin_dashboard_full.txt
+backend/__pycache__/
+backend/*/__pycache__/
+frontend/node_modules/
+frontend/dist/

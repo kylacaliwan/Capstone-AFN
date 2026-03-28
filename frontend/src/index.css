@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f3f7fb;
+  --card: #ffffff;
+  --card-sub: #f7fafc;
+  --primary: #1f54b4;
+  --accent: #1e54d7;
+  --text: #1f2937;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #eef3f9, #f8fcff);
+  color: var(--text);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  box-shadow: 0 0 24px rgba(15,23,42,0.07);
+}
+
+.ghost-btn {
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  color: var(--primary);
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  min-height: 300px;
+}

@@ -1,0 +1,12 @@
+Django>=4.2,<7.0
+djangorestframework>=3.14,<4.0
+django-cors-headers>=4.3,<5.0
+channels>=4.0,<5.0
+channels-redis>=4.0,<5.0
+daphne>=4.0,<5.0
+twilio>=8.0,<10.0
+firebase-admin>=6.0,<7.0
+python-dotenv>=1.0,<2.0
+psycopg2-binary>=2.9,<3.0
+# openrouteservice 3.x is not published for Python 3.13; pin to latest 2.x that supports 3.13
+openrouteservice>=2.3.3,<3.0
