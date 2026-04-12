@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -46,6 +46,9 @@ export default function Login() {
       </div>
       <div className="w-full h-full max-w-md bg-white p-8 text-slate-800 shadow-xl">
         <div className='mt-16'>
+          <div className='w-full flex justify-center'>
+            <img src="/logo1.png" width={116} p-10 mb-10 alt="logo" />
+          </div>
           <h1 className="text-2xl text-center font-bold mb-1">AFN Service Management</h1>
           <p className="text-sm text-center text-slate-500 mb-14">Sign in to your account</p>
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import {
   FiAlertTriangle,
@@ -215,6 +216,24 @@ const roleMenu = {
 
 export default function Sidebar({ role, isOpen, onClose }) {
   const { user, logout } = useAuth();
+
+  const navigate = useNavigate();
+  const handleLogout = async () => {
+    await logout();
+    navigate('../client/hero.jsx'); // 👈 your landing page route
+  };
+  const displayName =
+  user?.first_name?.trim() || user?.username || user?.email || 'Team member';
+
+const roleLabelMap = {
+  admin: 'Admin',
+  follow_up: 'After Sales',
+  supervisor: 'Supervisor',
+  technician: 'Technician',
+  client: 'Client'
+};
+
+const roleLabel = roleLabelMap[user?.role] || 'User';
   const location = useLocation();
   const [afterSalesStats, setAfterSalesStats] = useState(null);
 
@@ -278,7 +297,7 @@ export default function Sidebar({ role, isOpen, onClose }) {
           isOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        <div className="mb-5 rounded-2xl bg-gradient-to-br from-slate-950 via-slate-900 to-sky-900 p-4 text-white shadow-lg">
+        <div className="hidden mb-5 rounded-2xl bg-gradient-to-br from-slate-950 via-slate-900 to-sky-900 p-4 text-white shadow-lg">
           <div className="flex items-center justify-between">
             <div>
               <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-200">AFN Portal</p>
@@ -289,6 +308,10 @@ export default function Sidebar({ role, isOpen, onClose }) {
               x
             </button>
           </div>
+        </div>
+
+        <div className='w-full flex items-center justify-center mb-10 '>
+          <img className='h-20 w-30' src="/logo.png"  alt="logo" />
         </div>
 
         <nav className="space-y-5">
@@ -334,17 +357,34 @@ export default function Sidebar({ role, isOpen, onClose }) {
           ))}
         </nav>
 
-        <div className='flex items-center justify-center w-full mt-10'>
-          <button
-          onClick={logout}
-          className="inline-flex w-full items-center justify-center gap-1 rounded-xl bg-red-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-red-600 sm:px-3 sm:py-2"
-        >
-          <FiLogOut />
-          <span className="hidden sm:inline">Logout</span>
-        </button>
+        <div className='mt-8 -mx-3 md:-mx-4'>
+          <div className='w-full bg-blue-300 p-4 flex flex-col gap-4'>
+            
+            {/* USER INFO */}
+            <div className='flex items-center gap-3'>
+              <img className='h-10 w-10 rounded-full' src="/user-icon.png" alt="user" />
+              
+              <div className='flex flex-col'>
+                <span className='text-sm font-semibold text-slate-800'>
+                  {displayName}
+                </span>
+                <span className='text-xs text-slate-500'>
+                  {roleLabel}
+                </span>
+              </div>
+            </div>
 
+            {/* LOGOUT BUTTON */}
+            <button
+              onClick={handleLogout}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-red-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-red-600"
+            >
+              <FiLogOut />
+              <span>Logout</span>
+            </button>
+
+          </div>
         </div>
-        
       </aside>
     </>
   );

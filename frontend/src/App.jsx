@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { useFirebase } from './hooks/useFirebase';
 
+import Hero from './pages/hero';
 const Login = lazy(() => import('./pages/Login'));
 const Register = lazy(() => import('./pages/Register'));
 const AdminDashboard = lazy(() => import('./pages/admin/AdminDashboard'));
@@ -88,7 +89,13 @@ function AppRoutes() {
       {user ? <FirebaseBootstrap /> : null}
       <Suspense fallback={<div className="grid min-h-screen place-items-center text-slate-600">Loading...</div>}>
         <Routes>
-          <Route path="/" element={<RoleRedirect role={user?.role} />} />
+          <Route
+            path="/"
+            element={
+              user ? <RoleRedirect role={user.role} /> : <Hero />
+            }
+          />
+          <Route path="/" element={<Hero />} />
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
 

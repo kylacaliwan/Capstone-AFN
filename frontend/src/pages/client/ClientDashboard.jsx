@@ -83,35 +83,6 @@ export default function ClientDashboard() {
 
   return (
     <Layout>
-      <section className="rounded-3xl bg-gradient-to-br from-slate-950 via-slate-900 to-cyan-900 px-5 py-6 text-white shadow-xl sm:px-6 sm:py-7 lg:px-8">
-        <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-          <div className="max-w-3xl">
-            <p className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-200">Client Service Hub</p>
-            <h2 className="mt-2 text-2xl font-semibold sm:text-3xl lg:text-4xl">Everything active, nothing hidden.</h2>
-            <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-200 sm:text-base">
-              Modern service portals work best when they make status obvious. This dashboard keeps your
-              open requests, ticket progress, alerts, and next actions in one simple flow.
-            </p>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2 lg:min-w-[300px]">
-            <button
-              onClick={() => navigate('/client/service-requests')}
-              className="inline-flex items-center justify-center rounded-2xl bg-cyan-400 px-4 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300"
-            >
-              <FiPlusSquare className="mr-2" />
-              New Service Request
-            </button>
-            <button
-              onClick={() => navigate('/client/requests')}
-              className="inline-flex items-center justify-center rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold text-white backdrop-blur transition hover:bg-white/20"
-            >
-              <FiClipboard className="mr-2" />
-              Track Open Tickets
-            </button>
-          </div>
-        </div>
-      </section>
-
       <section className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatsCard title="All requests" value={overview.total_requests ?? 0} />
         <StatsCard title="Active requests" value={overview.active_requests ?? 0} color="text-amber-600" />

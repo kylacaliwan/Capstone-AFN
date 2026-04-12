@@ -383,17 +383,6 @@ export default function ClientProfile() {
             )}
           </div>
 
-          {/* Account Actions */}
-          <div className="bg-white rounded-lg shadow-sm border border-slate-200 p-6">
-            <h3 className="text-lg font-semibold text-slate-900 mb-4">Account</h3>
-            <button
-              onClick={logout}
-              className="w-full px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
-            >
-              Sign Out
-            </button>
-          </div>
-
           {/* Info Box */}
           <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
             <p className="text-sm text-blue-900">

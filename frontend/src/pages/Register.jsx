@@ -5,9 +5,10 @@ import { useAuth } from '../context/AuthContext';
 export default function Register() {
   const navigate = useNavigate();
   const { register } = useAuth();
+
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  
+
   const [formData, setFormData] = useState({
     username: '',
     email: '',
@@ -22,9 +23,9 @@ export default function Register() {
 
   const handleChange = (e) => {
     const { name, value } = e.target;
-    setFormData(prev => ({
+    setFormData((prev) => ({
       ...prev,
-      [name]: value
+      [name]: value,
     }));
   };
 
@@ -33,7 +34,6 @@ export default function Register() {
     setError('');
     setLoading(true);
 
-    // Basic validation
     if (!formData.username || !formData.email || !formData.password) {
       setError('Username, email, and password are required');
       setLoading(false);
@@ -52,34 +52,45 @@ export default function Register() {
       return;
     }
 
-    const result = await register({
-      username: formData.username,
-      email: formData.email,
-      password: formData.password,
-      password_confirm: formData.password_confirm,
-      first_name: formData.first_name,
-      last_name: formData.last_name,
-      phone: formData.phone,
-      address: formData.address,
-      role: 'client',
-    });
+    try {
+      const result = await register({
+        ...formData,
+        role: 'client',
+      });
 
-    setLoading(false);
+      setLoading(false);
 
-    if (!result || !result.success) {
-      setError(result?.message || 'Registration failed. Please try again.');
-      return;
+      if (!result || !result.success) {
+        setError(result?.message || 'Registration failed. Please try again.');
+        return;
+      }
+
+      navigate('/login', {
+        state: { message: 'Registration successful! Please log in.' },
+      });
+    } catch (err) {
+      setLoading(false);
+      setError('Something went wrong. Please try again.');
     }
-
-    // Registration successful
-    navigate('/login', { state: { message: 'Registration successful! Please log in.' } });
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-gradient-to-br from-blue-500 to-cyan-600 text-white items-center justify-center px-4 py-8">
-      <div className="bg-white text-slate-800 rounded-2xl shadow-xl w-full max-w-md p-8">
-        <h1 className="text-2xl font-bold mb-1">Create Account</h1>
-        <p className="text-sm text-slate-500 mb-6">Create a client account to start requesting service.</p>
+    <div className="flex h-screen bg-[url('/register-bg.jpg')] bg-cover bg-center text-white">
+      
+      {/* LEFT SIDE (Overlay Text) */}
+      <div className="flex bg-black bg-opacity-65 h-screen w-full font-semibold items-center">
+        <h1 className="text-6xl w-[60%] m-32">
+          Your Partner in Solar and Smart Home Solutions.
+        </h1>
+      </div>
+
+      {/* RIGHT SIDE (FORM) */}
+      <div className="absolute right-0 top-0 h-full w-full max-w-md bg-white py-14 px-14 text-slate-800 shadow-xl overflow-y-auto">
+        
+        <h1 className="text-2xl font-bold mb-1 text-center">Create Account</h1>
+        <p className="text-sm text-slate-500 mb-6 text-center">
+          Create a client account to start requesting service.
+        </p>
 
         {error && (
           <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-lg mb-4">
@@ -88,133 +99,99 @@ export default function Register() {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Username */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Username *</label>
-            <input
-              type="text"
-              name="username"
-              value={formData.username}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="Choose a username"
-              required
-            />
-          </div>
+          
+          <input
+            type="text"
+            name="username"
+            value={formData.username}
+            onChange={handleChange}
+            placeholder="Username *"
+            className="w-full rounded-lg border px-3 py-2"
+            required
+          />
 
-          {/* Email */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Email *</label>
-            <input
-              type="email"
-              name="email"
-              value={formData.email}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="Enter your email"
-              required
-            />
-          </div>
+          <input
+            type="email"
+            name="email"
+            value={formData.email}
+            onChange={handleChange}
+            placeholder="Email *"
+            className="w-full rounded-lg border px-3 py-2"
+            required
+          />
 
-          {/* First Name */}
-          <div>
-            <label className="block text-sm font-medium mb-1">First Name</label>
-            <input
-              type="text"
-              name="first_name"
-              value={formData.first_name}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="(Optional)"
-            />
-          </div>
+          <input
+            type="text"
+            name="first_name"
+            value={formData.first_name}
+            onChange={handleChange}
+            placeholder="First Name (Optional)"
+            className="w-full rounded-lg border px-3 py-2"
+          />
 
-          {/* Last Name */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Last Name</label>
-            <input
-              type="text"
-              name="last_name"
-              value={formData.last_name}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="(Optional)"
-            />
-          </div>
+          <input
+            type="text"
+            name="last_name"
+            value={formData.last_name}
+            onChange={handleChange}
+            placeholder="Last Name (Optional)"
+            className="w-full rounded-lg border px-3 py-2"
+          />
 
-          {/* Phone */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Phone</label>
-            <input
-              type="tel"
-              name="phone"
-              value={formData.phone}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="(Optional)"
-            />
-          </div>
+          <input
+            type="tel"
+            name="phone"
+            value={formData.phone}
+            onChange={handleChange}
+            placeholder="Phone (Optional)"
+            className="w-full rounded-lg border px-3 py-2"
+          />
 
-          {/* Address */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Address</label>
-            <input
-              type="text"
-              name="address"
-              value={formData.address}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="(Optional)"
-            />
-          </div>
+          <input
+            type="text"
+            name="address"
+            value={formData.address}
+            onChange={handleChange}
+            placeholder="Address (Optional)"
+            className="w-full rounded-lg border px-3 py-2"
+          />
 
           <div className="rounded-lg border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-900">
             Public signup creates a client account.
-            Technicians, supervisors, after-sales staff, and admins should be created from the admin user management area.
           </div>
 
-          {/* Password */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Password *</label>
-            <input
-              type="password"
-              name="password"
-              value={formData.password}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="At least 6 characters"
-              required
-            />
-          </div>
+          <input
+            type="password"
+            name="password"
+            value={formData.password}
+            onChange={handleChange}
+            placeholder="Password *"
+            className="w-full rounded-lg border px-3 py-2"
+            required
+          />
 
-          {/* Confirm Password */}
-          <div>
-            <label className="block text-sm font-medium mb-1">Confirm Password *</label>
-            <input
-              type="password"
-              name="password_confirm"
-              value={formData.password_confirm}
-              onChange={handleChange}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              placeholder="Re-enter your password"
-              required
-            />
-          </div>
+          <input
+            type="password"
+            name="password_confirm"
+            value={formData.password_confirm}
+            onChange={handleChange}
+            placeholder="Confirm Password *"
+            className="w-full rounded-lg border px-3 py-2"
+            required
+          />
 
-          {/* Submit Button */}
           <button
             type="submit"
             disabled={loading}
-            className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium py-2 rounded-lg transition-colors"
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg"
           >
             {loading ? 'Creating Account...' : 'Create Account'}
           </button>
         </form>
 
-        {/* Link to Login */}
         <p className="text-center text-sm text-slate-600 mt-6">
           Already have an account?{' '}
-          <Link to="/login" className="text-blue-600 font-medium hover:underline">
+          <Link to="/login" className="text-blue-600 hover:underline">
             Sign in
           </Link>
         </p>
