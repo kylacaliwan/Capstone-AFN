@@ -1,12 +1,18 @@
 import requests
 import sys
+import os
 
 
 def run():
     print('=== starting test_http.py ===')
 
     base = 'http://127.0.0.1:8000/api'
-    creds = {'username': 'testuser2', 'password': 'ClientPassword123!'}
+    username = os.environ.get('AFN_HTTP_TEST_USERNAME', '').strip()
+    password = os.environ.get('AFN_HTTP_TEST_PASSWORD', '').strip()
+    if not username or not password:
+        raise SystemExit('Set AFN_HTTP_TEST_USERNAME and AFN_HTTP_TEST_PASSWORD before running this script.')
+
+    creds = {'username': username, 'password': password}
     print('logging in')
     try:
         resp = requests.post(base + '/users/login/', json=creds, timeout=10)

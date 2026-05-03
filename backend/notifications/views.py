@@ -1,5 +1,6 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import MethodNotAllowed
 from rest_framework.response import Response
 from django.utils import timezone
 from .models import Notification, FirebaseToken
@@ -9,12 +10,16 @@ class NotificationViewSet(viewsets.ModelViewSet):
     queryset = Notification.objects.all()
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
     
     def get_queryset(self):
         # Return only notifications for the current user
         return Notification.objects.filter(user=self.request.user).select_related(
             'user', 'ticket', 'request'
         ).order_by('-created_at')
+
+    def create(self, request, *args, **kwargs):
+        raise MethodNotAllowed('POST')
     
     @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):

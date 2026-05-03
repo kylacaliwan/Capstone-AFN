@@ -46,6 +46,37 @@ class MessageSerializer(serializers.ModelSerializer):
         except Exception:
             return None
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        request = self.context.get('request')
+        sender = getattr(request, 'user', None)
+        ticket = attrs.get('ticket') or getattr(self.instance, 'ticket', None)
+        receiver = attrs.get('receiver') or getattr(self.instance, 'receiver', None)
+
+        if ticket is None:
+            raise serializers.ValidationError({'ticket': 'A related ticket is required.'})
+        if receiver is None:
+            raise serializers.ValidationError({'receiver': 'A message receiver is required.'})
+        if not sender or not sender.is_authenticated:
+            raise serializers.ValidationError('Authentication is required to send a message.')
+
+        participant_ids = {
+            ticket.request.client_id,
+            ticket.technician_id,
+            ticket.supervisor_id,
+        }
+        participant_ids.discard(None)
+
+        if sender.id not in participant_ids:
+            raise serializers.ValidationError('You can only send messages for tickets you are part of.')
+        if receiver.id not in participant_ids:
+            raise serializers.ValidationError({'receiver': 'Receiver must belong to the same ticket thread.'})
+        if receiver.id == sender.id:
+            raise serializers.ValidationError({'receiver': 'Choose another participant for this message.'})
+
+        return attrs
+
     class Meta:
         model = Message
         fields = [

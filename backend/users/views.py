@@ -1,25 +1,49 @@
-from rest_framework import viewsets, permissions, status
+from django.conf import settings as django_settings
+from django.contrib.auth import authenticate
+from django.contrib.auth.tokens import default_token_generator
+from django.core.mail import send_mail
+from django.db.models import Avg, Count, Q
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
+from django.utils import timezone
+from rest_framework import permissions, status, viewsets
+from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
-from django.contrib.auth import authenticate
-from django.db.models import Avg, Count, Q
-from django.utils import timezone
+from rest_framework.throttling import ScopedRateThrottle
 from collections import defaultdict
 import logging
 
 logger = logging.getLogger(__name__)
 
-from .models import User
+from .models import AdminSettings, User, UserCapabilityGrant
 from .serializers import (
     UserSerializer, UserRegistrationSerializer, UserLoginSerializer,
     UserUpdateSerializer, SelfUserUpdateSerializer,
-    TechnicianLocationUpdateSerializer, PasswordChangeSerializer
+    TechnicianLocationUpdateSerializer, PasswordChangeSerializer,
+    PasswordResetRequestSerializer, PasswordResetConfirmSerializer,
+    AdminSettingsSerializer, CapabilityGrantUpdateSerializer,
+    CapabilityDefinitionSerializer,
 )
 from .permissions import (
-    IsAdmin, IsSupervisor, IsTechnician, IsClient,
-    IsAdminOrSupervisor, IsAdminOrSupervisorOrTechnician,
-    IsOwnerOrAdmin, CanManageUsers
+    IsAdmin, IsSuperadmin, IsSupervisor, IsTechnician, IsClient,
+    IsAdminOrSupervisor, IsAdminOrSupervisorOrTechnician, IsSuperadminOrSupervisor,
+    IsOwnerOrAdmin, CanManageUsers, CanManageStaffCapabilities, CanViewUserDirectory,
+    CanViewSupervisorTechnicianDirectory,
+)
+from .rbac import (
+    MANAGE_STAFF_CAPABILITIES,
+    USER_DIRECTORY_VIEW_CAPABILITIES,
+    can_manage_user_capabilities,
+    get_assignable_capability_codes,
+    get_capability_catalog,
+    get_role_capabilities,
+    get_user_capability_codes,
+    get_user_direct_capability_codes,
+    is_admin_workspace_role,
+    is_superadmin_role,
+    user_has_any_capability,
+    user_has_capability,
 )
 from services.models import ServiceRequest, ServiceTicket, ServiceType
 from services.serializers import ServiceTypeSerializer
@@ -28,7 +52,7 @@ from services.models import TechnicianSkill
 
 def authenticate_user_credentials(identifier, password):
     """
-    Accept username or email and self-heal legacy plain-text passwords.
+    Accept username or email and authenticate against Django's auth backend.
     """
     user = authenticate(username=identifier, password=password)
     if user:
@@ -42,11 +66,17 @@ def authenticate_user_credentials(identifier, password):
         if not candidate or not candidate.is_active:
             return None
 
-        # Some older records were saved with raw passwords. If we detect a raw
-        # match, convert it to a proper Django hash and continue with normal auth.
-        if '$' not in (candidate.password or '') and candidate.password == password:
-            candidate.set_password(password)
-            candidate.save(update_fields=['password'])
+        # Detect legacy plain-text passwords and log a warning.
+        if '$' not in (candidate.password or ''):
+            logger.warning(
+                'User %s (id=%s) has a plain-text password. '
+                'Re-hashing it after successful legacy login.',
+                candidate.username, candidate.pk,
+            )
+            if candidate.password == password:
+                candidate.set_password(password)
+                candidate.save(update_fields=['password'])
+                return candidate
 
         return authenticate(username=candidate.username, password=password)
 
@@ -59,27 +89,84 @@ def authenticate_user_credentials(identifier, password):
     return authenticate_candidate(username_candidate)
 
 
+def get_password_reset_users(identifier):
+    """
+    Resolve password-reset targets by username or email without exposing whether
+    the identifier exists. Duplicate emails are supported by sending a reset
+    email for each matching active account.
+    """
+    lookup_value = (identifier or '').strip()
+    if not lookup_value:
+        return []
+
+    if '@' in lookup_value:
+        return list(User.objects.filter(email__iexact=lookup_value, is_active=True).order_by('id'))
+
+    user = User.objects.filter(username__iexact=lookup_value, is_active=True).first()
+    return [user] if user else []
+
+
+def send_password_reset_email(user):
+    if not user.email:
+        logger.warning('Skipping password reset email for user %s because no email address is set.', user.pk)
+        return
+
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    reset_link = (
+        f"{django_settings.FRONTEND_BASE_URL.rstrip('/')}/reset-password"
+        f"?uid={uid}&token={token}"
+    )
+    display_name = user.get_full_name().strip() or user.username
+    message = (
+        f"Hello {display_name},\n\n"
+        "We received a request to reset the password for your AFN Service Management account.\n"
+        f"Username: {user.username}\n"
+        f"Reset your password here: {reset_link}\n\n"
+        "If you did not request this, you can safely ignore this email."
+    )
+
+    send_mail(
+        subject='Reset your AFN Service Management password',
+        message=message,
+        from_email=django_settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[user.email],
+        fail_silently=False,
+    )
+
+
 class IsAdminOrReadOnly(permissions.BasePermission):
     def has_permission(self, request, view):
         if request.method in permissions.SAFE_METHODS:
             return True
-        return request.user and request.user.role in ['admin', 'supervisor']
+        return request.user and (is_admin_workspace_role(request.user.role) or request.user.role == 'supervisor')
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.all()
+    queryset = User.objects.all().prefetch_related('capability_grants')
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_permissions(self):
         """Return appropriate permissions based on action"""
-        if self.action in ['login', 'register']:
+        if self.action in ['login', 'register', 'password_reset_request', 'password_reset_confirm']:
             return [permissions.AllowAny()]
+        elif self.action in ['available_capabilities', 'capabilities']:
+            return [CanManageStaffCapabilities()]
         elif self.action in ['create', 'update', 'partial_update', 'destroy']:
             return [CanManageUsers()]
         elif self.action == 'list':
-            return [IsAdminOrSupervisor()]
+            return [CanViewUserDirectory()]
         return [permissions.IsAuthenticated()]
+
+    def get_throttles(self):
+        if self.action == 'login':
+            self.throttle_scope = 'login'
+            return [ScopedRateThrottle()]
+        if self.action in ['password_reset_request', 'password_reset_confirm']:
+            self.throttle_scope = 'password_reset'
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
 
     def get_queryset(self):
         """Filter queryset based on user role"""
@@ -89,13 +176,16 @@ class UserViewSet(viewsets.ModelViewSet):
         # Support filtered users by query param from admin dashboard
         role_filter = self.request.query_params.get('role')
 
-        if user.role == 'admin':
-            queryset = User.objects.all()
+        if is_superadmin_role(user.role):
+            queryset = User.objects.all().prefetch_related('capability_grants')
+        elif user.role == 'admin' and user_has_any_capability(user, USER_DIRECTORY_VIEW_CAPABILITIES):
+            queryset = User.objects.all().prefetch_related('capability_grants')
+        elif user.role == 'supervisor' and user_has_capability(user, MANAGE_STAFF_CAPABILITIES):
+            queryset = User.objects.filter(role__in=['technician', 'follow_up']).prefetch_related('capability_grants')
         elif user.role == 'supervisor':
-            # Supervisors can see all users except other supervisors/admins
-            queryset = User.objects.exclude(role__in=['admin', 'supervisor'])
-        elif user.role in ['technician', 'client']:
-            queryset = User.objects.filter(id=user.id)
+            queryset = User.objects.none()
+        elif user.role in ['admin', 'technician', 'client']:
+            queryset = User.objects.filter(id=user.id).prefetch_related('capability_grants')
 
         if role_filter:
             queryset = queryset.filter(role=role_filter)
@@ -179,6 +269,127 @@ class UserViewSet(viewsets.ModelViewSet):
             request.user.save()
             return Response({'message': 'Password changed successfully'})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
+    def password_reset_request(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        identifier = serializer.validated_data['identifier']
+
+        try:
+            for user in get_password_reset_users(identifier):
+                send_password_reset_email(user)
+        except Exception as exc:
+            logger.error('Password reset email failed for identifier %s: %s', identifier, exc, exc_info=True)
+            return Response(
+                {'error': 'Unable to send password reset email right now. Please try again later.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response({
+            'message': 'If an account exists for that email or username, a password reset link has been sent.'
+        })
+
+    @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
+    def password_reset_confirm(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            user_id = force_str(urlsafe_base64_decode(serializer.validated_data['uid']))
+            user = User.objects.get(pk=user_id, is_active=True)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            return Response(
+                {'error': 'This password reset link is invalid or has expired.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        token = serializer.validated_data['token']
+        if not default_token_generator.check_token(user, token):
+            return Response(
+                {'error': 'This password reset link is invalid or has expired.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.set_password(serializer.validated_data['new_password'])
+        user.save(update_fields=['password'])
+        Token.objects.filter(user=user).delete()
+
+        return Response({
+            'message': 'Password has been reset successfully. Please sign in with your new password.'
+        })
+
+    @action(detail=False, methods=['get'])
+    def available_capabilities(self, request):
+        capability_catalog = get_capability_catalog(include_non_assignable=False)
+        assignable_codes = get_assignable_capability_codes(request.user)
+        allowed_capabilities = [
+            capability
+            for capability in capability_catalog
+            if capability['code'] in assignable_codes
+        ]
+        serializer = CapabilityDefinitionSerializer(allowed_capabilities, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get', 'put'])
+    def capabilities(self, request, pk=None):
+        try:
+            target_user = User.objects.prefetch_related('capability_grants').get(pk=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not can_manage_user_capabilities(request.user, target_user):
+            return Response(
+                {'error': 'You do not have permission to manage this user.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        allowed_capabilities = get_assignable_capability_codes(request.user, target_user=target_user)
+
+        if request.method.lower() == 'put':
+            serializer = CapabilityGrantUpdateSerializer(
+                data=request.data,
+                context={'allowed_capabilities': allowed_capabilities},
+            )
+            serializer.is_valid(raise_exception=True)
+            requested_capabilities = set(serializer.validated_data['capabilities'])
+            current_capabilities = get_user_direct_capability_codes(target_user)
+
+            capabilities_to_add = sorted(requested_capabilities - current_capabilities)
+            capabilities_to_remove = sorted(current_capabilities - requested_capabilities)
+
+            for capability_code in capabilities_to_add:
+                UserCapabilityGrant.objects.create(
+                    user=target_user,
+                    capability_code=capability_code,
+                    granted_by=request.user,
+                )
+
+            if capabilities_to_remove:
+                UserCapabilityGrant.objects.filter(
+                    user=target_user,
+                    capability_code__in=capabilities_to_remove,
+                ).delete()
+
+            target_user = User.objects.prefetch_related('capability_grants').get(pk=target_user.pk)
+
+        capability_catalog = get_capability_catalog(include_non_assignable=False)
+        visible_catalog = [
+            capability
+            for capability in capability_catalog
+            if capability['code'] in allowed_capabilities
+        ]
+
+        return Response({
+            'user_id': target_user.id,
+            'username': target_user.username,
+            'role': target_user.role,
+            'role_capabilities': sorted(get_role_capabilities(target_user.role)),
+            'direct_capabilities': sorted(get_user_direct_capability_codes(target_user)),
+            'effective_capabilities': sorted(get_user_capability_codes(target_user)),
+            'available_capabilities': CapabilityDefinitionSerializer(visible_catalog, many=True).data,
+        })
     
 class AuthViewSet(viewsets.ViewSet):
     """ViewSet for authentication endpoints that don't require authentication"""
@@ -192,6 +403,12 @@ class AuthViewSet(viewsets.ViewSet):
         if self.action in ['technicians', 'clients']:
             return [IsAdminOrSupervisor()]
         return [permissions.IsAuthenticated()]
+
+    def get_throttles(self):
+        if self.action == 'login':
+            self.throttle_scope = 'login'
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
 
     @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
     def login(self, request):
@@ -290,12 +507,12 @@ class AdminTechniciansViewSet(viewsets.ViewSet):
 
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
-            return [permissions.IsAuthenticated(), IsAdminOrSupervisor()]
-        return [permissions.IsAuthenticated(), IsAdmin()]
+            return [permissions.IsAuthenticated(), CanViewSupervisorTechnicianDirectory()]
+        return [permissions.IsAuthenticated(), IsSuperadmin()]
 
     def list(self, request):
         """Get all technicians"""
-        technicians = User.objects.filter(role='technician')
+        technicians = User.objects.filter(role='technician').prefetch_related('capability_grants')
         serializer = UserSerializer(technicians, many=True)
         skills_by_technician = {}
         for skill in TechnicianSkill.objects.filter(technician__in=technicians).select_related('service_type'):
@@ -324,7 +541,7 @@ class AdminTechniciansViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         """Get a specific technician"""
         try:
-            technician = User.objects.get(id=pk, role='technician')
+            technician = User.objects.prefetch_related('capability_grants').get(id=pk, role='technician')
             serializer = UserSerializer(technician)
             return Response(serializer.data)
         except User.DoesNotExist:
@@ -334,7 +551,7 @@ class AdminTechniciansViewSet(viewsets.ViewSet):
         """Update a technician"""
         try:
             technician = User.objects.get(id=pk, role='technician')
-            serializer = UserUpdateSerializer(technician, data=request.data, partial=True)
+            serializer = UserUpdateSerializer(technician, data=request.data, partial=True, context={'request': request})
             if serializer.is_valid():
                 serializer.save()
                 return Response(UserSerializer(technician).data)
@@ -343,22 +560,24 @@ class AdminTechniciansViewSet(viewsets.ViewSet):
             return Response({'error': 'Technician not found'}, status=status.HTTP_404_NOT_FOUND)
 
     def destroy(self, request, pk=None):
-        """Delete a technician"""
+        """Deactivate a technician instead of hard-deleting"""
         try:
             technician = User.objects.get(id=pk, role='technician')
-            technician.delete()
-            return Response({'message': 'Technician deleted'}, status=status.HTTP_204_NO_CONTENT)
+            technician.status = 'inactive'
+            technician.is_active = False
+            technician.save(update_fields=['status', 'is_active'])
+            return Response({'message': 'Technician deactivated'}, status=status.HTTP_204_NO_CONTENT)
         except User.DoesNotExist:
             return Response({'error': 'Technician not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 class AdminClientsViewSet(viewsets.ViewSet):
     """ViewSet for admin client management"""
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    permission_classes = [permissions.IsAuthenticated, IsSuperadmin]
 
     def list(self, request):
         """Get all clients"""
-        clients = User.objects.filter(role='client')
+        clients = User.objects.filter(role='client').prefetch_related('capability_grants')
         serializer = UserSerializer(clients, many=True)
         return Response(serializer.data)
 
@@ -375,7 +594,7 @@ class AdminClientsViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         """Get a specific client"""
         try:
-            client = User.objects.get(id=pk, role='client')
+            client = User.objects.prefetch_related('capability_grants').get(id=pk, role='client')
             serializer = UserSerializer(client)
             return Response(serializer.data)
         except User.DoesNotExist:
@@ -385,7 +604,7 @@ class AdminClientsViewSet(viewsets.ViewSet):
         """Update a client"""
         try:
             client = User.objects.get(id=pk, role='client')
-            serializer = UserUpdateSerializer(client, data=request.data, partial=True)
+            serializer = UserUpdateSerializer(client, data=request.data, partial=True, context={'request': request})
             if serializer.is_valid():
                 serializer.save()
                 return Response(UserSerializer(client).data)
@@ -394,22 +613,24 @@ class AdminClientsViewSet(viewsets.ViewSet):
             return Response({'error': 'Client not found'}, status=status.HTTP_404_NOT_FOUND)
 
     def destroy(self, request, pk=None):
-        """Delete a client"""
+        """Deactivate a client instead of hard-deleting"""
         try:
             client = User.objects.get(id=pk, role='client')
-            client.delete()
-            return Response({'message': 'Client deleted'}, status=status.HTTP_204_NO_CONTENT)
+            client.status = 'inactive'
+            client.is_active = False
+            client.save(update_fields=['status', 'is_active'])
+            return Response({'message': 'Client deactivated'}, status=status.HTTP_204_NO_CONTENT)
         except User.DoesNotExist:
             return Response({'error': 'Client not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 class AdminUsersViewSet(viewsets.ViewSet):
-    """ViewSet for admin all users management"""
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    """ViewSet for superadmin account management."""
+    permission_classes = [permissions.IsAuthenticated, IsSuperadmin]
 
     def list(self, request):
         """Get all users"""
-        users = User.objects.all()
+        users = User.objects.all().prefetch_related('capability_grants')
         serializer = UserSerializer(users, many=True)
         return Response(serializer.data)
 
@@ -424,7 +645,7 @@ class AdminUsersViewSet(viewsets.ViewSet):
     def retrieve(self, request, pk=None):
         """Get a specific user"""
         try:
-            user = User.objects.get(id=pk)
+            user = User.objects.prefetch_related('capability_grants').get(id=pk)
             serializer = UserSerializer(user)
             return Response(serializer.data)
         except User.DoesNotExist:
@@ -434,7 +655,7 @@ class AdminUsersViewSet(viewsets.ViewSet):
         """Update a user"""
         try:
             user = User.objects.get(id=pk)
-            serializer = UserUpdateSerializer(user, data=request.data, partial=True)
+            serializer = UserUpdateSerializer(user, data=request.data, partial=True, context={'request': request})
             if serializer.is_valid():
                 serializer.save()
                 return Response(UserSerializer(user).data)
@@ -446,6 +667,8 @@ class AdminUsersViewSet(viewsets.ViewSet):
         """Deactivate a user without deleting their record"""
         try:
             user = User.objects.get(id=pk)
+            if user.role == 'superadmin':
+                return Response({'error': 'The superadmin account cannot be deactivated here.'}, status=status.HTTP_400_BAD_REQUEST)
             user.status = 'inactive'
             user.is_active = False
             user.save(update_fields=['status', 'is_active'])
@@ -458,25 +681,36 @@ class AdminSettingsViewSet(viewsets.ViewSet):
     """ViewSet for admin settings"""
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
+    def _get_settings(self):
+        settings_obj = AdminSettings.objects.order_by('id').first()
+        if settings_obj:
+            return settings_obj
+
+        return AdminSettings.objects.create(
+            system_name='AFN Service Management',
+            support_email='support@afnservice.com',
+            enable_notifications=True,
+            auto_dispatch_enabled=False,
+            sms_notifications_enabled=False,
+            default_time_zone=django_settings.TIME_ZONE,
+            max_technician_assignments=5,
+        )
+
     def list(self, request):
         """Get admin settings"""
-        settings_data = {
-            'enableNotifications': True,
-            'defaultTimeZone': 'Africa/Lagos',
-            'systemName': 'AFN Service Management',
-            'supportEmail': 'support@afn.com',
-            'maxTechnicianAssignments': 5,
-            'autoDispatchEnabled': True,
-            'smsNotificationsEnabled': True,
-        }
-        return Response(settings_data)
+        serializer = AdminSettingsSerializer(self._get_settings())
+        return Response(serializer.data)
 
     def update(self, request, pk=None):
         """Update admin settings via the router's standard PUT endpoint"""
+        settings_obj = self._get_settings()
+        serializer = AdminSettingsSerializer(settings_obj, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
         return Response({
             'success': True,
             'message': 'Settings updated successfully',
-            'settings': request.data
+            'settings': serializer.data
         })
 
     @action(detail=False, methods=['put'])
@@ -553,6 +787,7 @@ class AdminAnalyticsViewSet(viewsets.ViewSet):
         service_breakdown = self._build_service_breakdown(today)
         top_technician = self._build_top_technician(today)
         completion_trend = self._build_completion_trend(today)
+        monthly_service_trend = self._build_monthly_service_trend(today)
         predictive_summary, service_forecasts, daily_forecast = self._build_predictive_analytics(today)
         busiest_months = self._build_busiest_months(today)
         busiest_weeks = self._build_busiest_weeks(today)
@@ -573,6 +808,7 @@ class AdminAnalyticsViewSet(viewsets.ViewSet):
             'jobCountByService': service_breakdown,
             'topTech': top_technician,
             'completionTrend': completion_trend,
+            'monthlyServiceTrend': monthly_service_trend,
             'predictiveSummary': predictive_summary,
             'serviceForecasts': service_forecasts,
             'dailyForecast': daily_forecast,
@@ -691,6 +927,54 @@ class AdminAnalyticsViewSet(viewsets.ViewSet):
                 ).count(),
             })
         return trend
+
+    def _build_monthly_service_trend(self, today):
+        def shift_month(month_start, offset):
+            month_index = (month_start.month - 1) + offset
+            year = month_start.year + (month_index // 12)
+            month = (month_index % 12) + 1
+            return month_start.replace(year=year, month=month, day=1)
+
+        current_month_start = today.replace(day=1)
+        first_month_start = shift_month(current_month_start, -5)
+
+        buckets = {}
+        for offset in range(6):
+            month_start = shift_month(first_month_start, offset)
+            buckets[month_start] = {
+                'monthStart': month_start.isoformat(),
+                'label': month_start.strftime('%b %Y'),
+                'requestCount': 0,
+                'completedCount': 0,
+            }
+
+        for request_obj in ServiceRequest.objects.filter(request_date__date__gte=first_month_start):
+            request_dt = request_obj.request_date
+            request_day = (
+                timezone.localtime(request_dt).date()
+                if timezone.is_aware(request_dt) else request_dt.date()
+            )
+            month_start = request_day.replace(day=1)
+            if month_start not in buckets:
+                continue
+
+            buckets[month_start]['requestCount'] += 1
+            if request_obj.status == 'Completed':
+                buckets[month_start]['completedCount'] += 1
+
+        monthly_service_trend = []
+        for month_start in sorted(buckets.keys()):
+            bucket = buckets[month_start]
+            completion_rate = (
+                (bucket['completedCount'] / bucket['requestCount']) * 100
+                if bucket['requestCount'] else 0
+            )
+            monthly_service_trend.append({
+                **bucket,
+                'completionRate': round(completion_rate, 1),
+            })
+
+        return monthly_service_trend
 
     def _build_busiest_months(self, today):
         window_start = (today.replace(day=1) - timezone.timedelta(days=370)).replace(day=1)

@@ -170,6 +170,15 @@ def get_route(start_coords, end_coords, profile='driving-car'):
     return _build_synthetic_route(start_coords, end_coords, profile, reason='osrm_unavailable')
 
 
+def _require_client():
+    """Raise a clear error when the ORS client is not configured."""
+    if client is None:
+        raise RuntimeError(
+            'OpenRouteService client is not configured. '
+            'Set the ORS_API_KEY environment variable and install the openrouteservice package.'
+        )
+
+
 def get_directions(coordinates, profile='driving-car', **kwargs):
     """Wrapper for multi-point directions.
 
@@ -178,26 +187,31 @@ def get_directions(coordinates, profile='driving-car', **kwargs):
     profile : str
     kwargs : additional ORS options (format, instructions, etc.)
     """
+    _require_client()
     params = {'coordinates': coordinates, 'profile': profile}
     params.update(kwargs)
     return client.directions(**params)
 
 
-def get_isochrones(locations, profile='driving-car', range=None, **kwargs):
+def get_isochrones(locations, profile='driving-car', ors_range=None, **kwargs):
     """Obtain isochrones for given locations.
 
     locations : list of [lng, lat]
-    range : int or list of ints (seconds or meters)
+    ors_range : int or list of ints (seconds or meters)
     """
+    _require_client()
     params = {'locations': locations, 'profile': profile}
-    if range is not None:
-        params['range'] = range
+    if ors_range is not None:
+        params['range'] = ors_range
     params.update(kwargs)
     return client.isochrones(**params)
 
 
-def get_matrix(locations, profile='driving-car', metrics=['distance'], **kwargs):
+def get_matrix(locations, profile='driving-car', metrics=None, **kwargs):
     """Compute distance/duration matrix."""
+    _require_client()
+    if metrics is None:
+        metrics = ['distance']
     params = {'locations': locations, 'profile': profile, 'metrics': metrics}
     params.update(kwargs)
     return client.distance_matrix(**params)
@@ -205,6 +219,7 @@ def get_matrix(locations, profile='driving-car', metrics=['distance'], **kwargs)
 
 def snap_points(coordinates, profile='driving-car', **kwargs):
     """Snap a set of coordinates to the road network."""
+    _require_client()
     params = {'coordinates': coordinates, 'profile': profile}
     params.update(kwargs)
     return client.snap(**params)

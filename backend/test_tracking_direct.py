@@ -15,6 +15,13 @@ from services.views import TechnicianLocationHistoryViewSet
 from users.models import User
 
 
+def required_env(name):
+    value = os.environ.get(name, '').strip()
+    if not value:
+        raise SystemExit(f'Set {name} before creating debug users.')
+    return value
+
+
 def main():
     print("=== DIRECT TECHNICIAN TRACKING TEST ===\n")
 
@@ -27,7 +34,7 @@ def main():
         }
     )
     if created:
-        tech.set_password('tech123')
+        tech.set_password(required_env('AFN_DEBUG_TECH_PASSWORD'))
         tech.save(update_fields=['password'])
     print(f"[OK] Technician: {tech.username}")
 
@@ -39,7 +46,7 @@ def main():
         }
     )
     if created:
-        supervisor.set_password('track123')
+        supervisor.set_password(required_env('AFN_DEBUG_SUPERVISOR_PASSWORD'))
         supervisor.save(update_fields=['password'])
 
     token, _ = Token.objects.get_or_create(user=tech)

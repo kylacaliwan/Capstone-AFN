@@ -1,5 +1,5 @@
 
-from django.db import models
+from django.db import models, transaction
 from django.conf import settings
 
 
@@ -141,22 +141,20 @@ class InventoryItem(models.Model):
         
         # Notify all admins
         from users.models import User
-        admins = User.objects.filter(role='admin')
+        admins = User.objects.filter(role__in=['superadmin', 'admin'])
         
         for admin in admins:
             Notification.objects.get_or_create(
                 user=admin,
                 message=message,
                 type=notif_type,
-                defaults={'created_at': timezone.now()}
             )
         
         # Send SMS alert
         send_low_stock_alert(self)
         
-        # Update last notification time
-        self.last_notification_sent = timezone.now()
-        self.save(update_fields=['last_notification_sent'])
+        # Update last notification time without calling save() to avoid recursion
+        InventoryItem.objects.filter(pk=self.pk).update(last_notification_sent=timezone.now())
     
     @property
     def available_quantity(self):
@@ -218,24 +216,31 @@ class InventoryTransaction(models.Model):
         return f"{self.transaction_type} - {self.item.name} - {self.quantity}"
     
     def save(self, *args, **kwargs):
-        # Update inventory quantities
-        if self.transaction_type in ['purchase', 'return']:
-            self.item.quantity += self.quantity
-        elif self.transaction_type in ['issue', 'transfer']:
-            self.item.quantity -= self.quantity
-        elif self.transaction_type == 'reservation':
-            self.item.reserved_quantity += self.quantity
-        elif self.transaction_type == 'cancellation':
-            self.item.reserved_quantity -= self.quantity
-        elif self.transaction_type == 'adjustment':
-            self.item.quantity = self.quantity  # Direct set
-            
-        # Save item first, then trigger notification
-        self.item.save()
-        super().save(*args, **kwargs)
-        
+        # Wrap both saves in a transaction to prevent partial updates
+        with transaction.atomic():
+            # Snapshot old item state for notification comparison
+            old_available = self.item.available_quantity
+
+            # Update inventory quantities
+            if self.transaction_type in ['purchase', 'return']:
+                self.item.quantity += self.quantity
+            elif self.transaction_type in ['issue', 'transfer']:
+                self.item.quantity -= self.quantity
+            elif self.transaction_type == 'reservation':
+                self.item.reserved_quantity += self.quantity
+            elif self.transaction_type == 'cancellation':
+                self.item.reserved_quantity -= self.quantity
+            elif self.transaction_type == 'adjustment':
+                self.item.quantity = self.quantity  # Direct set
+
+            # Save item first, then the transaction record
+            self.item.save()
+            super().save(*args, **kwargs)
+
         # Check and send low stock notification after transaction
-        self.item.check_and_notify_low_stock()
+        # Only notify if available quantity actually decreased
+        if self.item.available_quantity < old_available:
+            self.item.check_and_notify_low_stock()
 
 
 class InventoryReservation(models.Model):

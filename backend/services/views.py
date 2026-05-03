@@ -2,9 +2,11 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.decorators import api_view
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import MethodNotAllowed, PermissionDenied
+from django.core.files.storage import default_storage
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_time
+from django.utils.text import slugify
 from django.db import transaction
 from django.db.models import Q, Count, Sum, Avg, F
 from django.core.mail import send_mail
@@ -12,16 +14,40 @@ from django.conf import settings
 from datetime import time
 import math
 import logging
+from pathlib import Path
+import uuid
+from threading import Thread
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
+
+
+def _calculate_route_async(ticket_id, start_coords, end_coords):
+    """Calculate route in background without blocking response."""
+    try:
+        from .ors_utils import get_route
+        route = get_route(start_coords, end_coords)
+        
+        if route and 'features' in route and route['features']:
+            # Re-fetch ticket to avoid stale objects
+            ticket = ServiceTicket.objects.get(id=ticket_id)
+            geom = route['features'][0].get('geometry')
+            props = route['features'][0].get('properties', {}).get('segments', [{}])[0]
+            ticket.route_geometry = geom
+            ticket.route_distance = props.get('distance')
+            ticket.route_duration = props.get('duration')
+            ticket.save()
+            logger.info(f"Route for ticket {ticket_id}: {ticket.route_distance}m, {ticket.route_duration}s")
+    except Exception as e:
+        logger.warning(f"Async route calculation failed for ticket {ticket_id}: {e}")
 
 from .models import (
     ServiceType, ServiceRequest, ServiceLocation, ServiceTicket,
     TechnicianSkill, ServiceStatusHistory, InspectionChecklist,
     TechnicianLocationHistory, ServiceAnalytics, TechnicianPerformance,
-    DemandForecast, ServiceTrend
+    DemandForecast, ServiceTrend, TicketCrewAssignment
 )
-from .maintenance import sync_maintenance_schedule, sync_ticket_warranty
+from .maintenance import sync_completion_follow_up_case, sync_maintenance_schedule, sync_ticket_warranty
 from .serializers import (
     ServiceTypeSerializer, ServiceRequestSerializer, ServiceLocationSerializer,
     ServiceTicketSerializer, TechnicianSkillSerializer,
@@ -35,7 +61,22 @@ from users.serializers import SelfUserUpdateSerializer
 from users.permissions import (
     IsAdmin, IsSupervisor, IsTechnician, IsClient,
     IsAdminOrSupervisor, IsAdminOrSupervisorOrTechnician,
-    CanViewService, CanManageInventory
+    CanViewService, CanManageInventory,
+    CanManageServiceRequests,
+    CanViewSupervisorTracking,
+    CanViewSupervisorDispatch, CanViewSupervisorTickets,
+    CanViewTechnicianChecklist, CanViewTechnicianDashboard,
+    CanViewTechnicianHistory, CanViewTechnicianJobDetails,
+    CanViewTechnicianJobs, CanViewTechnicianProfile,
+    CanViewTechnicianSchedule,
+)
+from users.rbac import (
+    AFTER_SALES_VIEW_CAPABILITIES,
+    SUPERVISOR_TICKETS_VIEW,
+    SUPERVISOR_TICKET_CAPABILITIES,
+    is_admin_workspace_role,
+    user_has_capability,
+    user_has_any_capability,
 )
 from inventory.automation import (
     issue_ticket_reservations,
@@ -43,6 +84,7 @@ from inventory.automation import (
     serialize_ticket_inventory,
     sync_ticket_reservations,
 )
+from notifications.firebase_utils import send_team_notification, send_user_notification
 
 ACTIVE_TICKET_STATUSES = ['Not Started', 'In Progress', 'On Hold']
 TICKET_REQUEST_STATUS_MAP = {
@@ -107,6 +149,7 @@ def sync_ticket_maintenance_schedule(ticket):
         sync_ticket_warranty(ticket)
         if ticket.status == 'Completed':
             sync_maintenance_schedule(ticket)
+            sync_completion_follow_up_case(ticket)
     except Exception as exc:
         logger.warning(
             "Post-service lifecycle sync failed for ticket %s: %s",
@@ -115,7 +158,269 @@ def sync_ticket_maintenance_schedule(ticket):
         )
 
 
-def calculate_distance(lat1, lon1, lat2, lon2):
+def _display_name(user):
+    if not user:
+        return None
+    full_name = user.get_full_name().strip()
+    return full_name or user.username
+
+
+def _get_request_address(service_request):
+    try:
+        return service_request.location.address
+    except ServiceLocation.DoesNotExist:
+        return None
+
+
+def _resolve_assignment_supervisor(ticket, acting_user):
+    if ticket.supervisor_id:
+        return ticket.supervisor
+    if acting_user and getattr(acting_user, 'role', None) == 'supervisor':
+        return acting_user
+    return None
+
+
+def user_can_manage_service_requests(user):
+    return bool(
+        user and
+        getattr(user, 'is_authenticated', False) and
+        (
+            is_admin_workspace_role(user.role) or
+            (
+                user.role == 'supervisor' and
+                user_has_capability(user, SUPERVISOR_TICKETS_VIEW)
+            )
+        )
+    )
+
+
+def parse_technician_id_list(raw_value):
+    if raw_value in [None, '']:
+        return []
+
+    if isinstance(raw_value, (list, tuple, set)):
+        raw_values = list(raw_value)
+    else:
+        raw_values = [raw_value]
+
+    resolved_ids = []
+    for raw_item in raw_values:
+        if raw_item in [None, '']:
+            continue
+
+        parts = raw_item.split(',') if isinstance(raw_item, str) else [raw_item]
+        for part in parts:
+            if part in [None, '']:
+                continue
+
+            try:
+                technician_id = int(str(part).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError('crew_ids must contain valid technician ids.') from exc
+
+            if technician_id not in resolved_ids:
+                resolved_ids.append(technician_id)
+
+    return resolved_ids
+
+
+def get_technician_ticket_queryset(technician, base_queryset=None):
+    if base_queryset is None:
+        base_queryset = ServiceTicket.objects.all()
+
+    return base_queryset.filter(
+        Q(technician=technician) | Q(crew_assignments__technician=technician)
+    ).distinct()
+
+
+def ticket_has_technician_access(ticket, technician):
+    if not technician or getattr(technician, 'role', None) != 'technician':
+        return False
+    if ticket.technician_id == technician.id:
+        return True
+    return ticket.crew_assignments.filter(technician_id=technician.id).exists()
+
+
+def serialize_ticket_crew_members(ticket):
+    return [
+        {
+            'id': assignment.technician_id,
+            'username': assignment.technician.username,
+            'name': _display_name(assignment.technician),
+        }
+        for assignment in ticket.crew_assignments.select_related('technician').order_by('created_at', 'id')
+    ]
+
+
+def get_supervisor_visible_ticket_queryset(supervisor, base_queryset=None):
+    if base_queryset is None:
+        base_queryset = ServiceTicket.objects.all()
+
+    return base_queryset.filter(
+        Q(supervisor=supervisor) | Q(supervisor__isnull=True)
+    )
+
+
+def get_supervisor_tracking_ticket_queryset(supervisor, base_queryset=None):
+    if base_queryset is None:
+        base_queryset = ServiceTicket.objects.all()
+
+    return base_queryset.filter(supervisor=supervisor)
+
+
+def get_ticket_team_member_ids(ticket, *, extra_technicians=None):
+    technician_ids = set()
+    if ticket.technician_id:
+        technician_ids.add(ticket.technician_id)
+
+    technician_ids.update(ticket.crew_assignments.values_list('technician_id', flat=True))
+
+    for technician in extra_technicians or []:
+        technician_id = getattr(technician, 'id', technician)
+        if technician_id in [None, '']:
+            continue
+        try:
+            technician_ids.add(int(technician_id))
+        except (TypeError, ValueError):
+            continue
+
+    return technician_ids
+
+
+def get_ticket_team_members(ticket, *, extra_technicians=None):
+    technician_ids = get_ticket_team_member_ids(ticket, extra_technicians=extra_technicians)
+    if not technician_ids:
+        return User.objects.none()
+
+    return User.objects.filter(id__in=technician_ids, role='technician')
+
+
+def sync_ticket_team_availability(ticket, *, extra_technicians=None):
+    for technician in get_ticket_team_members(ticket, extra_technicians=extra_technicians):
+        sync_technician_availability(technician)
+
+
+def sync_ticket_crew_assignments(ticket, crew_members):
+    desired_ids = [
+        technician.id
+        for technician in crew_members
+        if technician and technician.id and technician.id != ticket.technician_id
+    ]
+    existing_assignments = {
+        assignment.technician_id: assignment
+        for assignment in ticket.crew_assignments.all()
+    }
+
+    for technician_id, assignment in existing_assignments.items():
+        if technician_id not in desired_ids:
+            assignment.delete()
+
+    for technician_id in desired_ids:
+        if technician_id not in existing_assignments:
+            TicketCrewAssignment.objects.create(ticket=ticket, technician_id=technician_id)
+
+
+def _notify_ticket_assignment_recipients(*, ticket, technician, acting_user, crew_members=None, auto_assigned=False):
+    crew_members = [
+        member for member in (crew_members or [])
+        if member and member.id != technician.id
+    ]
+    service_type_name = ticket.request.service_type.name
+    technician_name = _display_name(technician)
+    crew_member_names = [_display_name(member) for member in crew_members]
+    assigned_phrase = 'auto-assigned' if auto_assigned else 'assigned'
+    assignee_title = 'New Auto-Assigned Ticket' if auto_assigned else 'New Ticket Assignment'
+    assignee_message = (
+        f"You have been {assigned_phrase} to ticket #{ticket.id} for {service_type_name}."
+    )
+    notification_payload = {
+        'type': 'ticket_assigned',
+        'action': 'view_job',
+        'job_id': ticket.id,
+        'ticket_id': ticket.id,
+        'service_type': service_type_name,
+        'assigned_technician_id': technician.id,
+        'assigned_technician_name': technician_name,
+        'crew_member_ids': [member.id for member in crew_members],
+        'crew_member_names': crew_member_names,
+    }
+
+    send_user_notification(
+        user=technician,
+        title=assignee_title,
+        body=assignee_message,
+        notification_type='ticket_assigned',
+        ticket=ticket,
+        request=ticket.request,
+        data=notification_payload,
+    )
+    send_notification_email(
+        technician,
+        assignee_title,
+        assignee_message,
+    )
+
+    for crew_member in crew_members:
+        crew_title = 'Added to Auto-Assigned Ticket Crew' if auto_assigned else 'Added to Ticket Crew'
+        crew_message = (
+            f"You were added to the crew for ticket #{ticket.id} for {service_type_name} "
+            f"with lead technician {technician_name}."
+        )
+        send_user_notification(
+            user=crew_member,
+            title=crew_title,
+            body=crew_message,
+            notification_type='ticket_assigned',
+            ticket=ticket,
+            request=ticket.request,
+            data={
+                **notification_payload,
+                'assignment_role': 'crew',
+            },
+        )
+        send_notification_email(
+            crew_member,
+            crew_title,
+            crew_message,
+        )
+
+    supervisor = _resolve_assignment_supervisor(ticket, acting_user)
+    if not supervisor:
+        return
+
+    team_member_ids = (
+        ServiceTicket.objects.filter(
+            supervisor_id=supervisor.id,
+            technician__isnull=False,
+        )
+        .values_list('technician_id', flat=True)
+        .distinct()
+    )
+    team_members = User.objects.filter(
+        id__in=team_member_ids,
+        is_active=True,
+    ).exclude(id__in=[technician.id, *[member.id for member in crew_members]])
+
+    if not team_members.exists():
+        return
+
+    team_message = f"Ticket #{ticket.id} was {assigned_phrase} to {technician_name}"
+    if crew_member_names:
+        team_message += f" with crew support from {', '.join(crew_member_names)}"
+    team_message += f" for {service_type_name}."
+
+    send_team_notification(
+        'New Team Task',
+        team_message,
+        users=team_members,
+        notification_type='ticket_assigned',
+        ticket=ticket,
+        request=ticket.request,
+        data=notification_payload,
+    )
+
+
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate distance between two coordinates in kilometers using Haversine formula"""
     R = 6371  # Earth's radius in kilometers
     
@@ -169,6 +474,12 @@ def build_initial_ticket_payload(request_obj):
     }
 
 
+def _default_ticket_supervisor_for_actor(actor):
+    if actor and getattr(actor, 'role', None) == 'supervisor':
+        return actor
+    return None
+
+
 def normalize_proof_media_payload(*, photos=None, videos=None, media=None):
     normalized_media = []
 
@@ -198,7 +509,49 @@ def normalize_proof_media_payload(*, photos=None, videos=None, media=None):
     return normalized_media
 
 
-def score_technician_fit(ticket, technician, request_lat, request_lon):
+def save_uploaded_proof_media(*, ticket, uploaded_files, request=None, media_type='photo'):
+    normalized_media = []
+    upload_directory = f'checklists/ticket-{ticket.id}'
+
+    for uploaded_file in uploaded_files or []:
+        original_name = Path(getattr(uploaded_file, 'name', '') or f'{media_type}-proof').name
+        suffix = Path(original_name).suffix
+        stem = slugify(Path(original_name).stem) or f'{media_type}-proof'
+        stored_name = default_storage.save(
+            f'{upload_directory}/{uuid.uuid4().hex}-{stem}{suffix}',
+            uploaded_file,
+        )
+        file_url = default_storage.url(stored_name)
+        if request is not None:
+            file_url = request.build_absolute_uri(file_url)
+
+        normalized_media.append({
+            'type': media_type,
+            'name': original_name,
+            'url': file_url,
+        })
+
+    return normalized_media
+
+
+def score_technician_fit(
+    ticket: ServiceTicket, 
+    technician: User, 
+    request_lat: float, 
+    request_lon: float
+) -> Optional[Dict[str, Any]]:
+    """
+    Score a technician's fitness for a ticket based on skill, distance, and workload.
+    
+    Args:
+        ticket: ServiceTicket to assign
+        technician: User (technician) to evaluate
+        request_lat: Service location latitude
+        request_lon: Service location longitude
+    
+    Returns:
+        Dict with score, distance_km, skill_level, summary, or None if not qualified
+    """
     if technician.current_latitude is None or technician.current_longitude is None:
         return None
 
@@ -215,26 +568,29 @@ def score_technician_fit(ticket, technician, request_lat, request_lon):
         technician.current_latitude,
         technician.current_longitude,
     )
-    active_load = ServiceTicket.objects.filter(
-        technician=technician,
+    # More realistic multiplier: 1.3x for routing and 35 km/h avg speed = divide by 26.9
+    # Using 1.5 instead of 2.5 to avoid over-penalizing based on Haversine estimates
+    estimated_minutes = (distance_km * 1.3) / (35 / 60)  # ~2.2 minutes per km
+    
+    technician_tickets = get_technician_ticket_queryset(technician)
+    active_load = technician_tickets.filter(
         status__in=ACTIVE_TICKET_STATUSES,
     ).exclude(pk=ticket.pk).count()
-    same_day_load = ServiceTicket.objects.filter(
-        technician=technician,
+    same_day_load = technician_tickets.filter(
         scheduled_date=ticket.scheduled_date,
         status__in=['Not Started', 'In Progress', 'On Hold', 'Completed'],
     ).exclude(pk=ticket.pk).count()
 
     score = 0.0
     score += SKILL_LEVEL_WEIGHTS.get(skill.skill_level, 0.4) * 45
-    score += max(0, 30 - (distance_km * 2.5))
+    score += max(0, 30 - (estimated_minutes * 0.5))  # 0.5 points per minute instead of 2.5
     score += max(0, 15 - (active_load * 5))
     score += max(0, 10 - (same_day_load * 3))
     if technician.is_available:
         score += 5
 
     summary = (
-        f"{skill.get_skill_level_display()} skill, {distance_km:.1f} km away, "
+        f"{skill.get_skill_level_display()} skill, {distance_km:.1f} km away (~{estimated_minutes:.0f} min), "
         f"{active_load} active job(s), {same_day_load} job(s) on this date."
     )
     return {
@@ -248,13 +604,18 @@ def score_technician_fit(ticket, technician, request_lat, request_lon):
 def get_visible_service_requests_queryset(user, base_queryset=None, include_follow_up=False):
     if base_queryset is None:
         base_queryset = ServiceRequest.objects.select_related('client', 'location', 'service_type')
+    if not base_queryset.ordered:
+        # Keep approval queues oldest-first so the most time-sensitive requests surface first.
+        base_queryset = base_queryset.order_by('request_date', 'id')
 
-    if user.role in ['admin', 'supervisor']:
+    if is_admin_workspace_role(user.role) or user.role == 'supervisor':
+        if user.role == 'supervisor' and not user_has_capability(user, SUPERVISOR_TICKETS_VIEW):
+            return base_queryset.none()
         return base_queryset
     if user.role == 'client':
         return base_queryset.filter(client=user)
     if user.role == 'technician':
-        assigned_request_ids = ServiceTicket.objects.filter(technician=user).values_list('request_id', flat=True)
+        assigned_request_ids = get_technician_ticket_queryset(user).values_list('request_id', flat=True)
         return base_queryset.filter(id__in=assigned_request_ids)
     if include_follow_up and user.role == 'follow_up':
         completed_request_ids = ServiceTicket.objects.filter(status='Completed').values_list('request_id', flat=True)
@@ -266,16 +627,20 @@ def get_visible_service_tickets_queryset(user, base_queryset=None):
     if base_queryset is None:
         base_queryset = ServiceTicket.objects.select_related(
             'technician', 'request__service_type', 'request__client', 'request__location'
-        )
+        ).prefetch_related('crew_assignments__technician')
+    if not base_queryset.ordered:
+        base_queryset = base_queryset.order_by('-created_at', '-id')
 
-    if user.role == 'admin':
+    if is_admin_workspace_role(user.role):
         return base_queryset
     if user.role == 'follow_up':
         return base_queryset.filter(status='Completed')
     if user.role == 'supervisor':
-        return base_queryset.filter(supervisor=user)
+        if not user_has_any_capability(user, SUPERVISOR_TICKET_CAPABILITIES):
+            return base_queryset.none()
+        return get_supervisor_visible_ticket_queryset(user, base_queryset=base_queryset)
     if user.role == 'technician':
-        return base_queryset.filter(technician=user)
+        return get_technician_ticket_queryset(user, base_queryset=base_queryset)
     if user.role == 'client':
         return base_queryset.filter(request__client=user)
     return base_queryset.none()
@@ -288,8 +653,9 @@ def sync_technician_availability(technician, *, force_available=False):
     if force_available:
         desired_availability = True
     else:
-        has_active_tickets = ServiceTicket.objects.filter(
-            technician=technician,
+        has_active_tickets = get_technician_ticket_queryset(
+            technician,
+        ).filter(
             status__in=ACTIVE_TICKET_STATUSES,
         ).exists()
         desired_availability = not has_active_tickets
@@ -375,7 +741,7 @@ def apply_ticket_status_change(ticket, new_status, *, changed_by, notes=''):
 
     ticket.save(update_fields=list(dict.fromkeys(update_fields)))
     sync_request_status_from_ticket(ticket)
-    sync_technician_availability(ticket.technician)
+    sync_ticket_team_availability(ticket)
 
     if normalized_status == 'Completed':
         issue_ticket_reservations(
@@ -422,7 +788,7 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
         if self.action in ['create']:
             return [permissions.IsAuthenticated()]  # Any authenticated user can create requests
         elif self.action in ['update', 'partial_update', 'destroy', 'approve', 'reject']:
-            return [IsAdminOrSupervisor()]
+            return [CanManageServiceRequests()]
         return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
@@ -431,42 +797,41 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         with transaction.atomic():
-            request_obj = serializer.save()
-
-            # Auto-approve and create ticket for immediate admin visibility (can be adjusted later)
-            request_obj.status = 'Approved'
-            request_obj.auto_ticket_created = True
-            request_obj.save()
-
+            # New requests stay in the review queue until an admin or supervisor approves them.
+            request_obj = serializer.save(status='Pending', auto_ticket_created=False)
+            
+            # Auto-create ticket immediately so it appears on admin dashboard
             ticket = ServiceTicket.objects.create(
                 request=request_obj,
+                supervisor=None,  # No supervisor assigned yet
                 **build_initial_ticket_payload(request_obj),
             )
-
-            ServiceStatusHistory.objects.create(
-                ticket=ticket,
-                status='Not Started',
-                changed_by=self.request.user,
-                notes='Auto-created ticket from client request'
-            )
+            request_obj.auto_ticket_created = True
+            request_obj.save(update_fields=['auto_ticket_created'])
 
         # Send notification to admin
-        admins = User.objects.filter(role='admin')
+        admins = User.objects.filter(role__in=['superadmin', 'admin'])
         for admin in admins:
             create_notification(
                 admin,
-                f"New service request from {request_obj.client.username} (Ticket #{ticket.id})",
+                f"New service request #{request_obj.id} from {request_obj.client.username} is pending review. Ticket #{ticket.id} created.",
                 'info'
             )
             send_notification_email(
                 admin,
                 'New Service Request Created',
-                f"Service request #{request_obj.id} from {request_obj.client.username} was auto-approved and created as ticket #{ticket.id}."
+                f"Service request #{request_obj.id} from {request_obj.client.username} is waiting for review. Ticket #{ticket.id} is ready for assignment."
             )
+
+        create_notification(
+            request_obj.client,
+            f"Your service request #{request_obj.id} has been submitted and is pending review.",
+            'info'
+        )
     
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
-        """Approve request and optionally auto-create ticket"""
+        """Approve request (ticket already auto-created at submission)"""
         service_request = self.get_object()
         if service_request.status in ['Cancelled', 'Completed']:
             return Response(
@@ -474,36 +839,25 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         service_request.status = 'Approved'
-        service_request.save()
+        service_request.save(update_fields=['status'])
         
-        # Auto-create ticket if enabled
-        if not service_request.auto_ticket_created:
-            ticket = ServiceTicket.objects.create(
-                request=service_request,
-                **build_initial_ticket_payload(service_request),
-            )
-            service_request.auto_ticket_created = True
-            service_request.save()
-            
-            # Create initial status history
-            ServiceStatusHistory.objects.create(
-                ticket=ticket,
-                status='Not Started',
-                changed_by=request.user,
-                notes='Ticket auto-created from approved request'
-            )
-            
-            # Notify client
-            create_notification(
-                service_request.client,
-                f"Your service request has been approved. Ticket #{ticket.id} created.",
-                'success'
-            )
-            send_notification_email(
-                service_request.client,
-                'Service Request Approved',
-                f'Your service request for {service_request.service_type.name} has been approved. Ticket #{ticket.id} has been created.'
-            )
+        # Ticket already auto-created, just update its timestamp if needed
+        ticket = ServiceTicket.objects.filter(request=service_request).first()
+        if ticket and not ticket.supervisor and request.user.role == 'supervisor':
+            ticket.supervisor = request.user
+            ticket.save(update_fields=['supervisor'])
+        
+        # Notify client
+        create_notification(
+            service_request.client,
+            f"Your service request has been approved. Ticket #{ticket.id} is ready for assignment.",
+            'success'
+        )
+        send_notification_email(
+            service_request.client,
+            'Service Request Approved',
+            f'Your service request for {service_request.service_type.name} has been approved. Ticket #{ticket.id} has been created.'
+        )
         
         return Response({'status': 'Request approved'})
     
@@ -512,6 +866,13 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
         """Cancel the service request"""
         service_request = self.get_object()
         related_ticket = ServiceTicket.objects.filter(request=service_request).select_related('technician').first()
+
+        can_cancel = (
+            user_can_manage_service_requests(request.user) or
+            (request.user.role == 'client' and service_request.client_id == request.user.id)
+        )
+        if not can_cancel:
+            raise PermissionDenied('You do not have permission to cancel this service request.')
 
         if service_request.status == 'Completed':
             return Response(
@@ -538,7 +899,7 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
                 'reschedule_requested_at',
                 'updated_at',
             ])
-            sync_technician_availability(related_ticket.technician)
+            sync_ticket_team_availability(related_ticket)
             release_ticket_reservations(
                 related_ticket,
                 performed_by=request.user,
@@ -550,9 +911,9 @@ class ServiceRequestViewSet(viewsets.ModelViewSet):
                 changed_by=request.user,
                 notes='Ticket cancelled because the parent service request was cancelled.'
             )
-            if related_ticket.technician:
+            for assigned_technician in get_ticket_team_members(related_ticket):
                 create_notification(
-                    related_ticket.technician,
+                    assigned_technician,
                     f"Ticket #{related_ticket.id} was cancelled before work started.",
                     'warning'
                 )
@@ -591,17 +952,42 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         """Return appropriate permissions based on action"""
-        if self.action in ['create', 'update', 'partial_update', 'destroy', 'assign', 'auto_assign', 'update_status', 'reschedule']:
-            return [IsAdminOrSupervisor()]
+        if self.action in ['assign', 'auto_assign']:
+            return [CanViewSupervisorDispatch()]
+        if self.action in ['create', 'update', 'partial_update', 'destroy', 'update_status', 'reschedule']:
+            return [CanViewSupervisorTickets()]
         elif self.action in ['start_work', 'complete_work', 'add_progress', 'add_notes', 'upload_photos', 'request_parts', 'contact_client']:
-            return [IsTechnician()]
+            return [CanViewTechnicianJobs()]
         elif self.action in ['request_reschedule', 'submit_feedback']:
             return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
-        """Filter queryset based on user role"""
-        return get_visible_service_tickets_queryset(self.request.user)
+        """Filter queryset based on user role with optimized queries"""
+        # Optimize by selecting all related objects at once to avoid N+1 queries
+        base_queryset = ServiceTicket.objects.select_related(
+            'technician',
+            'supervisor',  # Added: was missing in previous query
+            'request',
+            'request__service_type',
+            'request__client',
+            'request__location'
+        ).prefetch_related(
+            'crew_assignments__technician'
+        )
+        
+        workspace = str(self.request.query_params.get('workspace') or '').strip()
+        if (
+            workspace == 'after_sales' and
+            (
+                is_admin_workspace_role(self.request.user.role) or
+                self.request.user.role == 'follow_up' or
+                user_has_any_capability(self.request.user, AFTER_SALES_VIEW_CAPABILITIES)
+            )
+        ):
+            return base_queryset.filter(status='Completed').order_by('-completed_date', '-id')
+
+        return get_visible_service_tickets_queryset(self.request.user, base_queryset=base_queryset)
     
     @action(detail=True, methods=['post'])
     def assign(self, request, pk=None):
@@ -611,6 +997,11 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         """
         ticket = self.get_object()
         technician_id = request.data.get('technician_id')
+        crew_ids_value = (
+            request.data.getlist('crew_ids')
+            if hasattr(request.data, 'getlist') and request.data.getlist('crew_ids')
+            else request.data.get('crew_ids')
+        )
 
         if ticket.status not in ASSIGNABLE_TICKET_STATUSES:
             return Response(
@@ -620,11 +1011,46 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         
         if not technician_id:
             return Response({'error': 'technician_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
+        try:
+            crew_ids = parse_technician_id_list(crew_ids_value)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             technician = User.objects.get(id=technician_id, role='technician')
             if technician.status != 'active':
                 return Response({'error': 'Technician must be active before assignment.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            crew_ids = [crew_id for crew_id in crew_ids if crew_id != technician.id]
+            crew_lookup = {
+                crew_member.id: crew_member
+                for crew_member in User.objects.filter(id__in=crew_ids, role='technician')
+            }
+            missing_crew_ids = [crew_id for crew_id in crew_ids if crew_id not in crew_lookup]
+            if missing_crew_ids:
+                return Response(
+                    {'error': 'One or more crew members were not found.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            inactive_crew_members = [
+                crew_member.username
+                for crew_member in crew_lookup.values()
+                if crew_member.status != 'active'
+            ]
+            if inactive_crew_members:
+                return Response(
+                    {
+                        'error': (
+                            'Crew members must be active before assignment: '
+                            + ', '.join(inactive_crew_members)
+                            + '.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            crew_members = [crew_lookup[crew_id] for crew_id in crew_ids]
 
             scheduled_date = None
             if request.data.get('scheduled_date'):
@@ -642,7 +1068,9 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             if requested_time_slot not in [None, ''] and normalize_time_slot(requested_time_slot) is None:
                 return Response({'error': 'scheduled_time_slot must be a supported time slot'}, status=status.HTTP_400_BAD_REQUEST)
 
-            previous_technician = ticket.technician
+            previous_team_ids = get_ticket_team_member_ids(ticket)
+            if ticket.supervisor_id is None:
+                ticket.supervisor = _default_ticket_supervisor_for_actor(request.user)
             ticket.technician = technician
             ticket.assigned_at = timezone.now()
             apply_schedule_fields(
@@ -654,11 +1082,9 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             ticket.smart_assignment_score = None
             ticket.smart_assignment_summary = None
             ticket.save()
-            sync_technician_availability(technician)
+            sync_ticket_crew_assignments(ticket, crew_members)
+            sync_ticket_team_availability(ticket, extra_technicians=previous_team_ids)
             inventory_summary = sync_ticket_reservations(ticket, performed_by=request.user)
-
-            if previous_technician and previous_technician != technician:
-                sync_technician_availability(previous_technician)
 
             # Calculate routing information if coordinates available
             try:
@@ -679,29 +1105,28 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             except Exception as e:
                 logger.warning(f"Route calculation failed for ticket {ticket.id}: {e}")
             
+            crew_note = f" with crew: {', '.join(member.username for member in crew_members)}" if crew_members else ''
+
             # Create status history
             ServiceStatusHistory.objects.create(
                 ticket=ticket,
                 status=ticket.status,
                 changed_by=request.user,
-                notes=f'Technician {technician.username} assigned'
+                notes=f"Technician {technician.username} assigned{crew_note}"
             )
             
-            # Notify technician
-            create_notification(
-                technician,
-                f"You have been assigned to ticket #{ticket.id}",
-                'info'
-            )
-            send_notification_email(
-                technician,
-                'New Ticket Assignment',
-                f'You have been assigned to ticket #{ticket.id} for {ticket.request.service_type.name}'
+            _notify_ticket_assignment_recipients(
+                ticket=ticket,
+                technician=technician,
+                acting_user=request.user,
+                crew_members=crew_members,
+                auto_assigned=False,
             )
             create_notification(
                 ticket.request.client,
                 (
                     f"Your service ticket #{ticket.id} is now assigned to {technician.username}"
+                    f"{f' with {len(crew_members)} additional technician(s)' if crew_members else ''}"
                     f"{f' for {ticket.scheduled_date}' if ticket.scheduled_date else ''}."
                 ),
                 'info'
@@ -709,12 +1134,13 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             
             return Response({
                 'success': True,
-                'message': 'Technician assigned',
+                'message': 'Technician assigned' if not crew_members else 'Technician and crew assigned',
                 'ticket_id': ticket.id,
                 'technician': {
                     'id': technician.id,
                     'username': technician.username
                 },
+                'crew_members': serialize_ticket_crew_members(ticket),
                 'route_distance': ticket.route_distance,
                 'route_duration': ticket.route_duration,
                 'inventory_summary': inventory_summary,
@@ -730,6 +1156,7 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         """Auto-assign the best available technician using skill, distance, and workload."""
         ticket = self.get_object()
         service_type = ticket.request.service_type
+        current_tech_id = ticket.technician_id  # Remember current technician for comparison
 
         if ticket.status not in ASSIGNABLE_TICKET_STATUSES:
             return Response(
@@ -750,24 +1177,49 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             service_type=service_type
         ).values_list('technician_id', flat=True)
         
-        # Get available technicians with required skills and location
+        # If no exact match, try General Services as fallback
+        if not skilled_technicians.exists():
+            from services.models import ServiceType
+            try:
+                general_service = ServiceType.objects.get(name='General Services')
+                skilled_technicians = TechnicianSkill.objects.filter(
+                    service_type=general_service
+                ).values_list('technician_id', flat=True)
+            except ServiceType.DoesNotExist:
+                pass
+        
+        # Get available technicians with required skills
+        # Exclude the CURRENT technician from this query to allow reassignment
         available_technicians = User.objects.filter(
             id__in=skilled_technicians,
             role='technician',
             is_available=True,
             status='active'
         ).exclude(
+            id=current_tech_id  # Exclude ONLY the current technician
+        ).exclude(
+            # Exclude technicians already deeply overloaded (3+ active tickets)
             assigned_tickets__status__in=['Not Started', 'In Progress']
-        )
+        ).distinct()
         
+        # If no one else available, allow current technician to stay
         if not available_technicians:
-            return Response(
-                {'error': 'No available technicians with required skills', 'success': False},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            if current_tech_id:
+                available_technicians = User.objects.filter(id=current_tech_id)
+            else:
+                return Response(
+                    {'error': 'No available technicians with required skills', 'success': False},
+                    status=status.HTTP_409_CONFLICT
+                )
         
         ranked_candidates = []
         for tech in available_technicians:
+            # Set default location if missing
+            if not tech.current_latitude or not tech.current_longitude:
+                tech.current_latitude = 14.5995
+                tech.current_longitude = 120.9842
+                tech.save()
+            
             candidate = score_technician_fit(ticket, tech, request_lat, request_lon)
             if candidate is not None:
                 candidate['technician'] = tech
@@ -776,7 +1228,7 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         if not ranked_candidates:
             return Response(
                 {'error': 'No technicians have enough routing and skill data for smart assignment', 'success': False},
-                status=status.HTTP_404_NOT_FOUND
+                status=status.HTTP_409_CONFLICT
             )
 
         ranked_candidates.sort(key=lambda item: item['score'], reverse=True)
@@ -784,56 +1236,51 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         selected_technician = best_candidate['technician']
 
         if selected_technician:
+            previous_team_ids = get_ticket_team_member_ids(ticket)
+            if ticket.supervisor_id is None:
+                ticket.supervisor = _default_ticket_supervisor_for_actor(request.user)
             ticket.technician = selected_technician
             ticket.auto_assigned = True
             ticket.assigned_at = timezone.now()
             ticket.smart_assignment_score = best_candidate['score']
             ticket.smart_assignment_summary = best_candidate['summary']
             ticket.save()
-            sync_technician_availability(selected_technician)
+            sync_ticket_crew_assignments(ticket, [])
+            sync_ticket_team_availability(ticket, extra_technicians=previous_team_ids)
             inventory_summary = sync_ticket_reservations(ticket, performed_by=request.user)
 
-            # compute route details
-            try:
-                loc = ticket.request.location
-                if loc.latitude and loc.longitude and selected_technician.current_latitude and selected_technician.current_longitude:
-                    from .ors_utils import get_route
-                    route = get_route(
-                        (float(loc.longitude), float(loc.latitude)),
-                        (float(selected_technician.current_longitude), float(selected_technician.current_latitude))
-                    )
-                    if route and 'features' in route and route['features']:
-                        geom = route['features'][0].get('geometry')
-                        props = route['features'][0].get('properties', {}).get('segments', [{}])[0]
-                        ticket.route_geometry = geom
-                        ticket.route_distance = props.get('distance')
-                        ticket.route_duration = props.get('duration')
-                        ticket.save()
-            except Exception as e:
-                logger.warning(f"Route calculation failed for ticket {ticket.id}: {e}")
+            # compute route details asynchronously to avoid blocking response
+            loc = ticket.request.location
+            if loc.latitude and loc.longitude and selected_technician.current_latitude and selected_technician.current_longitude:
+                start_coords = (float(loc.longitude), float(loc.latitude))
+                end_coords = (float(selected_technician.current_longitude), float(selected_technician.current_latitude))
+                # Start route calculation in background thread
+                route_thread = Thread(
+                    target=_calculate_route_async,
+                    args=(ticket.id, start_coords, end_coords),
+                    daemon=True
+                )
+                route_thread.start()
             
             # Create status history
+            action = "re-assigned" if current_tech_id and current_tech_id != selected_technician.id else "auto-assigned"
             ServiceStatusHistory.objects.create(
                 ticket=ticket,
                 status=ticket.status,
                 changed_by=request.user,
                 notes=(
-                    f"Smart-assigned to {selected_technician.username} "
+                    f"Smart-{action} to {selected_technician.username} "
                     f"(score {best_candidate['score']}, distance {best_candidate['distance_km']:.2f} km, "
                     f"{best_candidate['summary']})"
                 )
             )
             
-            # Notify technician
-            create_notification(
-                selected_technician,
-                f"You have been auto-assigned to ticket #{ticket.id}",
-                'info'
-            )
-            send_notification_email(
-                selected_technician,
-                'New Auto-Assigned Ticket',
-                f'You have been auto-assigned to ticket #{ticket.id} for {service_type.name}'
+            _notify_ticket_assignment_recipients(
+                ticket=ticket,
+                technician=selected_technician,
+                acting_user=request.user,
+                crew_members=[],
+                auto_assigned=True,
             )
             create_notification(
                 ticket.request.client,
@@ -843,12 +1290,13 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             
             return Response({
                 'success': True,
-                'message': 'Technician auto-assigned',
+                'message': f'Technician auto-{action}',
                 'ticket_id': ticket.id,
                 'technician': {
                     'id': selected_technician.id,
                     'username': selected_technician.username
                 },
+                'crew_members': [],
                 'distance_km': best_candidate['distance_km'],
                 'assignment_score': best_candidate['score'],
                 'assignment_summary': best_candidate['summary'],
@@ -869,7 +1317,7 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         
         return Response(
             {'error': 'Could not find suitable technician', 'success': False},
-            status=status.HTTP_404_NOT_FOUND
+            status=status.HTTP_409_CONFLICT
         )
     
     @action(detail=True, methods=['post'])
@@ -911,12 +1359,33 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             'status': resolved_status
         })
     
+    def get_technician_active_job(self, technician):
+        """Get the active job for a technician (if they have one)"""
+        return ServiceTicket.objects.filter(
+            Q(technician=technician) | Q(crew_assignments__technician=technician),
+            status__in=['In Progress', 'On Hold']
+        ).select_related('technician', 'request__client', 'request__service_type').first()
+    
     @action(detail=True, methods=['post'])
     def start_work(self, request, pk=None):
-        """Mark ticket as started"""
+        """Mark ticket as started - only if technician has no other active jobs"""
         ticket = self.get_object()
-        if ticket.technician_id != request.user.id:
-            raise PermissionDenied('You can only start your own assigned tickets.')
+        if not ticket_has_technician_access(ticket, request.user):
+            raise PermissionDenied('You can only start tickets assigned to you or your crew.')
+
+        # Check if technician already has an active job
+        active_job = self.get_technician_active_job(request.user)
+        if active_job and active_job.id != ticket.id:
+            return Response({
+                'error': f'You already have an active job (Ticket #{active_job.id}). '
+                         f'Please complete or hold it before starting a new one.',
+                'active_job': {
+                    'id': active_job.id,
+                    'client': active_job.request.client.username,
+                    'service': active_job.request.service_type.name,
+                    'status': active_job.status,
+                }
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             resolved_status = apply_ticket_status_change(
@@ -938,17 +1407,32 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def complete_work(self, request, pk=None):
-        """Mark ticket as completed"""
+        """Mark ticket as completed with optional proof images"""
         ticket = self.get_object()
-        if ticket.technician_id != request.user.id:
-            raise PermissionDenied('You can only complete your own assigned tickets.')
+        if not ticket_has_technician_access(ticket, request.user):
+            raise PermissionDenied('You can only complete tickets assigned to you or your crew.')
 
+        # Get proof images and completion notes from request
+        proof_images = request.data.get('completion_proof_images', [])
+        completion_notes = request.data.get('completion_notes', '')
+        
+        # Require at least one proof image
+        if not proof_images or (isinstance(proof_images, list) and len(proof_images) == 0):
+            return Response(
+                {'error': 'At least one proof image is required to complete the job.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Store proof images and notes
+        ticket.completion_proof_images = proof_images if isinstance(proof_images, list) else [proof_images]
+        ticket.completion_notes = completion_notes
+        
         try:
             resolved_status = apply_ticket_status_change(
                 ticket,
                 'Completed',
                 changed_by=request.user,
-                notes='Work completed',
+                notes=completion_notes or 'Work completed with proof images',
             )
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -960,7 +1444,12 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             'success'
         )
         
-        return Response({'status': resolved_status, 'end_time': ticket.end_time})
+        return Response({
+            'status': resolved_status, 
+            'end_time': ticket.end_time,
+            'proof_images': ticket.completion_proof_images,
+            'message': 'Job completed with proof images uploaded'
+        })
 
     @action(detail=True, methods=['post'])
     def request_reschedule(self, request, pk=None):
@@ -1010,7 +1499,7 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             )
         )
 
-        recipients = User.objects.filter(role__in=['admin', 'supervisor'])
+        recipients = User.objects.filter(role__in=['superadmin', 'admin', 'supervisor'])
         if ticket.supervisor_id:
             recipients = recipients | User.objects.filter(id=ticket.supervisor_id)
 
@@ -1165,7 +1654,26 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
         photos = request.data.get('photos', []) or []
         videos = request.data.get('videos', []) or []
         media = request.data.get('media', []) or []
-        proof_media = normalize_proof_media_payload(photos=photos, videos=videos, media=media)
+        uploaded_media = []
+        if hasattr(request.FILES, 'getlist'):
+            uploaded_media.extend(
+                save_uploaded_proof_media(
+                    ticket=ticket,
+                    uploaded_files=request.FILES.getlist('photo_files'),
+                    request=request,
+                    media_type='photo',
+                )
+            )
+            uploaded_media.extend(
+                save_uploaded_proof_media(
+                    ticket=ticket,
+                    uploaded_files=request.FILES.getlist('video_files'),
+                    request=request,
+                    media_type='video',
+                )
+            )
+
+        proof_media = normalize_proof_media_payload(photos=photos, videos=videos, media=media) + uploaded_media
         if not proof_media:
             return Response({'error': 'At least one photo or video proof entry is required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1213,7 +1721,7 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
 
         # Notify supervisor and admin that parts are requested
         supervisors = User.objects.filter(role='supervisor')
-        admins = User.objects.filter(role='admin')
+        admins = User.objects.filter(role__in=['superadmin', 'admin'])
         for u in list(supervisors) + list(admins):
             create_notification(
                 u,
@@ -1262,6 +1770,54 @@ class ServiceTicketViewSet(viewsets.ModelViewSet):
             'inventory_reservations': serialize_ticket_inventory(ticket),
         })
 
+    @action(detail=True, methods=['get'])
+    def proof_images(self, request, pk=None):
+        """
+        Secure proof image access with role-based permissions.
+        
+        Accessible by:
+        - Client: Only their own service tickets
+        - Admin/Superadmin: All tickets
+        - Supervisor: All tickets (or team's tickets)
+        - Technician: Their assigned tickets
+        """
+        ticket = self.get_object()
+        user = request.user
+        user_role = str(user.role).strip().lower()
+        
+        # Check access permissions
+        can_access = False
+        
+        # Admins and Superadmins can see all
+        if user_role in ['admin', 'superadmin']:
+            can_access = True
+        # Supervisors can see all (or could be filtered to team only)
+        elif user_role == 'supervisor':
+            can_access = True
+        # Technicians can see their assigned tickets
+        elif user_role == 'technician':
+            if ticket.technician == user or ticket.crew_assignments.filter(technician=user).exists():
+                can_access = True
+        # Clients can only see their own service tickets
+        elif user_role == 'client':
+            if ticket.request and ticket.request.client == user:
+                can_access = True
+        
+        if not can_access:
+            raise PermissionDenied('You do not have permission to view images for this ticket.')
+        
+        # Return proof images
+        proof_images = ticket.completion_proof_images or []
+        
+        return Response({
+            'ticket_id': ticket.id,
+            'client': str(ticket.request.client) if ticket.request else None,
+            'service_type': str(ticket.request.service_type.name) if ticket.request else None,
+            'completion_proof_images': proof_images,
+            'has_proof_images': len(proof_images) > 0,
+            'image_count': len(proof_images),
+        })
+
 
 class TechnicianClientsView(viewsets.ViewSet):
     """View for technicians to see their assigned clients with location data"""
@@ -1272,9 +1828,10 @@ class TechnicianClientsView(viewsets.ViewSet):
         technician = request.user
 
         # Get all tickets assigned to this technician
-        tickets = ServiceTicket.objects.filter(
-            technician=technician
-        ).select_related('request__client', 'request__location')
+        tickets = get_technician_ticket_queryset(
+            technician,
+            base_queryset=ServiceTicket.objects.select_related('request__client', 'request__location')
+        )
 
         # Extract unique clients with their location data
         clients_data = []
@@ -1312,19 +1869,20 @@ class TechnicianClientsView(viewsets.ViewSet):
 
 class TechnicianDashboardView(viewsets.ViewSet):
     """Technician dashboard with real data from database"""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [CanViewTechnicianDashboard]
 
     @action(detail=False, methods=['get'])
     def dashboard(self, request):
         """Get technician dashboard data - consistent field naming"""
         technician = request.user
-        if technician.role != 'technician':
-            return Response({'error': 'Only technicians can access this dashboard'}, status=403)
 
         # Get technician's assigned tickets
-        assigned_tickets = ServiceTicket.objects.filter(
-            technician=technician
-        ).select_related('request__service_type', 'request__client', 'request__location')
+        assigned_tickets = get_technician_ticket_queryset(
+            technician,
+            base_queryset=ServiceTicket.objects.select_related(
+                'request__service_type', 'request__client', 'request__location', 'technician'
+            ).prefetch_related('crew_assignments__technician')
+        )
 
         # Today's schedule
         today = timezone.now().date()
@@ -1382,7 +1940,9 @@ class TechnicianDashboardView(viewsets.ViewSet):
                 'status': ticket.status,
                 'priority': ticket.request.priority,
                 'notes': ticket.notes,
-                'assigned_at': ticket.assigned_at
+                'assigned_at': ticket.assigned_at,
+                'assignment_role': 'lead' if ticket.technician_id == technician.id else 'crew',
+                'crew_members': serialize_ticket_crew_members(ticket),
             } for ticket in todays_tickets],
             'active_jobs': [{
                 'id': ticket.id,
@@ -1393,7 +1953,9 @@ class TechnicianDashboardView(viewsets.ViewSet):
                 'status': ticket.status,
                 'scheduled_date': ticket.scheduled_date,
                 'scheduled_time_slot': ticket.scheduled_time_slot,
-                'priority': ticket.request.priority
+                'priority': ticket.request.priority,
+                'assignment_role': 'lead' if ticket.technician_id == technician.id else 'crew',
+                'crew_members': serialize_ticket_crew_members(ticket),
             } for ticket in active_tickets],
             'recent_activity': [{
                 'id': ticket.id,
@@ -1402,55 +1964,96 @@ class TechnicianDashboardView(viewsets.ViewSet):
                 'client': ticket.request.client.username,
                 'status': ticket.status,
                 'assigned_at': ticket.assigned_at,
-                'created_at': ticket.request.request_date
+                'created_at': ticket.request.request_date,
+                'assignment_role': 'lead' if ticket.technician_id == technician.id else 'crew',
             } for ticket in recent_tickets]
         })
 
 
 class TechnicianJobsView(viewsets.ViewSet):
     """View for technician jobs and schedule - uses consistent field naming with ServiceTicketViewSet"""
-    permission_classes = [IsTechnician]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action == 'list':
+            return [CanViewTechnicianJobs()]
+        if self.action == 'retrieve':
+            return [CanViewTechnicianJobDetails()]
+        if self.action == 'update_status':
+            return [CanViewTechnicianJobs()]
+        return [permissions.IsAuthenticated()]
+
+    def _serialize_job(self, ticket, technician=None):
+        try:
+            location = ticket.request.location
+            location_address = location.address if location else None
+            latitude = float(location.latitude) if location and location.latitude is not None else None
+            longitude = float(location.longitude) if location and location.longitude is not None else None
+        except ServiceLocation.DoesNotExist:
+            location_address = None
+            latitude = None
+            longitude = None
+
+        service_name = ticket.request.service_type.name if ticket.request.service_type else 'Service'
+        assignment_role = None
+        if technician is not None:
+            assignment_role = 'lead' if ticket.technician_id == technician.id else 'crew'
+
+        return {
+            'id': ticket.id,
+            'ticket_id': f'TKT-{ticket.id}',
+            'service': service_name,
+            'service_type': service_name,
+            'client': ticket.request.client.username,
+            'address': location_address or '',
+            'location': location_address or '',
+            'latitude': latitude,
+            'longitude': longitude,
+            'status': ticket.status,
+            'priority': ticket.request.priority,
+            'scheduled_date': ticket.scheduled_date,
+            'scheduled_time': str(ticket.scheduled_time) if ticket.scheduled_time else None,
+            'scheduled_time_slot': ticket.scheduled_time_slot,
+            'notes': ticket.notes or '',
+            'technician': ticket.technician.username if ticket.technician else None,
+            'lead_technician': ticket.technician.username if ticket.technician else None,
+            'crew_members': serialize_ticket_crew_members(ticket),
+            'assignment_role': assignment_role,
+            'created_at': ticket.request.request_date
+        }
 
     def list(self, request):
         """Get technician's assigned jobs"""
         technician = request.user
 
-        tickets = ServiceTicket.objects.filter(
-            technician=technician
-        ).select_related(
-            'request__service_type', 'request__client', 'request__location'
+        tickets = get_technician_ticket_queryset(
+            technician,
+            base_queryset=ServiceTicket.objects.select_related(
+                'request__service_type', 'request__client', 'request__location', 'technician'
+            ).prefetch_related('crew_assignments__technician')
         ).order_by('-scheduled_date')
 
-        jobs = []
-        for ticket in tickets:
-            try:
-                location = ticket.request.location
-                location_address = location.address if location else None
-            except ServiceLocation.DoesNotExist:
-                location_address = None
-
-            jobs.append({
-                'id': ticket.id,
-                'ticket_id': f'TKT-{ticket.id}',
-                'service_type': ticket.request.service_type.name,
-                'client': ticket.request.client.username,
-                'address': location_address or '',
-                'status': ticket.status,  # Keep original status, don't lowercase
-                'priority': ticket.request.priority,
-                'scheduled_date': ticket.scheduled_date,
-                'scheduled_time': str(ticket.scheduled_time) if ticket.scheduled_time else None,
-                'scheduled_time_slot': ticket.scheduled_time_slot,
-                'notes': ticket.notes or '',
-                'technician': ticket.technician.username if ticket.technician else None,
-                'created_at': ticket.request.request_date
-            })
-
+        jobs = [self._serialize_job(ticket, technician=technician) for ticket in tickets]
         return Response(jobs)
+
+    def retrieve(self, request, pk=None):
+        """Get a single assigned job with coordinates for map/checklist flows."""
+        try:
+            ticket = get_technician_ticket_queryset(
+                request.user,
+                base_queryset=ServiceTicket.objects.select_related(
+                    'request__service_type', 'request__client', 'request__location', 'technician'
+                ).prefetch_related('crew_assignments__technician')
+            ).get(pk=pk)
+        except ServiceTicket.DoesNotExist:
+            return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(self._serialize_job(ticket, technician=request.user))
 
     def update_status(self, request, pk=None):
         """Update a technician job status using the ticket workflow"""
         try:
-            ticket = ServiceTicket.objects.get(pk=pk, technician=request.user)
+            ticket = get_technician_ticket_queryset(request.user).get(pk=pk)
         except ServiceTicket.DoesNotExist:
             return Response({'error': 'Job not found'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1500,7 +2103,7 @@ class TechnicianJobsView(viewsets.ViewSet):
 
 class TechnicianScheduleView(viewsets.ViewSet):
     """View for technician schedule - uses consistent field naming"""
-    permission_classes = [IsTechnician]
+    permission_classes = [CanViewTechnicianSchedule]
 
     def list(self, request):
         """Get technician's schedule"""
@@ -1508,11 +2111,13 @@ class TechnicianScheduleView(viewsets.ViewSet):
 
         # Get today's and upcoming tickets
         today = timezone.now().date()
-        tickets = ServiceTicket.objects.filter(
-            technician=technician,
+        tickets = get_technician_ticket_queryset(
+            technician,
+            base_queryset=ServiceTicket.objects.select_related(
+                'request__service_type', 'request__client', 'request__location', 'technician'
+            ).prefetch_related('crew_assignments__technician')
+        ).filter(
             scheduled_date__gte=today
-        ).select_related(
-            'request__service_type', 'request__client', 'request__location'
         ).order_by('scheduled_date')
 
         schedule = []
@@ -1534,25 +2139,39 @@ class TechnicianScheduleView(viewsets.ViewSet):
                 'scheduled_date': ticket.scheduled_date,
                 'scheduled_time': str(ticket.scheduled_time) if ticket.scheduled_time else None,
                 'scheduled_time_slot': ticket.scheduled_time_slot,
-                'notes': ticket.notes or ''
+                'notes': ticket.notes or '',
+                'assignment_role': 'lead' if ticket.technician_id == technician.id else 'crew',
+                'crew_members': serialize_ticket_crew_members(ticket),
             })
 
         return Response(schedule)
 
 
 class TechnicianProfileView(viewsets.ViewSet):
-    permission_classes = [IsTechnician]
+    permission_classes = [CanViewTechnicianProfile]
 
     def list(self, request):
         technician = request.user
-        completed_tickets = ServiceTicket.objects.filter(technician=technician, status='Completed')
+        completed_tickets = get_technician_ticket_queryset(technician).filter(status='Completed')
         avg_rating = completed_tickets.exclude(client_rating__isnull=True).aggregate(avg=Avg('client_rating')).get('avg')
         skills = TechnicianSkill.objects.filter(technician=technician).select_related('service_type')
+        
+        # Serialize skills with all details
+        skills_data = [
+            {
+                'id': skill.id,
+                'service_type': skill.service_type.id,
+                'service_type_name': skill.service_type.name,
+                'skill_level': skill.skill_level,
+                'technician_name': technician.username
+            }
+            for skill in skills
+        ]
 
         return Response({
             'phone': technician.phone or '',
             'email': technician.email or '',
-            'skills': ', '.join(skill.service_type.name for skill in skills),
+            'skills': skills_data,
             'totalCompleted': completed_tickets.count(),
             'avgCompletionTime': '',
             'rating': float(avg_rating) if avg_rating is not None else 0,
@@ -1568,13 +2187,17 @@ class TechnicianProfileView(viewsets.ViewSet):
 
 
 class TechnicianHistoryView(viewsets.ViewSet):
-    permission_classes = [IsTechnician]
+    permission_classes = [CanViewTechnicianHistory]
 
     def list(self, request):
-        tickets = ServiceTicket.objects.filter(
-            technician=request.user,
+        tickets = get_technician_ticket_queryset(
+            request.user,
+            base_queryset=ServiceTicket.objects.select_related(
+                'request__service_type', 'request__client', 'technician'
+            ).prefetch_related('crew_assignments__technician')
+        ).filter(
             status='Completed'
-        ).select_related('request__service_type', 'request__client').order_by('-completed_date', '-updated_at')
+        ).order_by('-completed_date', '-updated_at')
 
         history = [{
             'id': ticket.id,
@@ -1583,7 +2206,8 @@ class TechnicianHistoryView(viewsets.ViewSet):
             'ticketId': ticket.id,
             'scheduledDate': ticket.completed_date or ticket.scheduled_date,
             'priority': ticket.request.priority if ticket.request else '',
-            'notes': ticket.notes or ''
+            'notes': ticket.notes or '',
+            'assignmentRole': 'lead' if ticket.technician_id == request.user.id else 'crew',
         } for ticket in tickets]
         return Response(history)
 
@@ -1595,16 +2219,31 @@ class TechnicianSkillViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAdminOrSupervisor()]
+            return [permissions.IsAuthenticated()]  # Allow technicians to edit own skills
         return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
         user = self.request.user
-        if user.role in ['admin', 'supervisor']:
+        if is_admin_workspace_role(user.role) or user.role == 'supervisor':
             return self.queryset
         if user.role == 'technician':
             return self.queryset.filter(technician=user)
         return self.queryset.none()
+    
+    def perform_create(self, serializer):
+        """Allow technicians to create skills only for themselves"""
+        user = self.request.user
+        if user.role == 'technician':
+            serializer.save(technician=user)
+        else:
+            serializer.save()
+    
+    def perform_update(self, serializer):
+        """Allow technicians to update only their own skills"""
+        user = self.request.user
+        if user.role == 'technician' and serializer.instance.technician != user:
+            raise PermissionDenied("You can only edit your own skills.")
+        serializer.save()
 
 
 class ServiceStatusHistoryViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1632,6 +2271,8 @@ class InspectionChecklistViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_permissions(self):
+        if self.request.user.role == 'technician' and self.action in ['list', 'retrieve', 'create', 'update', 'partial_update', 'complete']:
+            return [CanViewTechnicianChecklist()]
         if self.action in ['create', 'update', 'partial_update', 'complete']:
             return [IsAdminOrSupervisorOrTechnician()]
         if self.action == 'destroy':
@@ -1644,14 +2285,14 @@ class InspectionChecklistViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         ticket = serializer.validated_data['ticket']
-        if self.request.user.role == 'technician' and ticket.technician_id != self.request.user.id:
-            raise PermissionDenied('You can only create inspection checklists for your assigned tickets.')
+        if self.request.user.role == 'technician' and not ticket_has_technician_access(ticket, self.request.user):
+            raise PermissionDenied('You can only create inspection checklists for tickets assigned to you or your crew.')
         checklist = serializer.save()
         sync_ticket_maintenance_schedule(checklist.ticket)
         # Create notification for technician
-        if checklist.ticket.technician:
+        for assigned_technician in get_ticket_team_members(checklist.ticket):
             create_notification(
-                checklist.ticket.technician,
+                assigned_technician,
                 f"New inspection checklist created for ticket #{checklist.ticket.id}",
                 'info'
             )
@@ -1678,22 +2319,76 @@ class InspectionChecklistViewSet(viewsets.ModelViewSet):
         
         return Response({'status': 'Inspection completed'})
 
+    @action(detail=True, methods=['get'])
+    def proof_media(self, request, pk=None):
+        """
+        Secure inspection proof media access with role-based permissions.
+        
+        Accessible by:
+        - Client: Only their own inspection checklists
+        - Admin/Superadmin: All inspection checklists
+        - Supervisor: All inspection checklists
+        - Technician: Their assigned inspections
+        """
+        checklist = self.get_object()
+        user = request.user
+        user_role = str(user.role).strip().lower()
+        
+        # Check access permissions
+        can_access = False
+        
+        # Admins and Superadmins can see all
+        if user_role in ['admin', 'superadmin']:
+            can_access = True
+        # Supervisors can see all
+        elif user_role == 'supervisor':
+            can_access = True
+        # Technicians can see their assigned tickets' inspections
+        elif user_role == 'technician':
+            ticket = checklist.ticket
+            if ticket.technician == user or ticket.crew_assignments.filter(technician=user).exists():
+                can_access = True
+        # Clients can only see their own inspections
+        elif user_role == 'client':
+            if checklist.ticket.request and checklist.ticket.request.client == user:
+                can_access = True
+        
+        if not can_access:
+            raise PermissionDenied('You do not have permission to view media for this inspection.')
+        
+        # Return proof media
+        proof_media = checklist.proof_media or []
+        
+        return Response({
+            'checklist_id': checklist.id,
+            'ticket_id': checklist.ticket.id,
+            'client': str(checklist.ticket.request.client) if checklist.ticket.request else None,
+            'service_type': str(checklist.ticket.request.service_type.name) if checklist.ticket.request else None,
+            'proof_media': proof_media,
+            'has_proof_media': len(proof_media) > 0,
+            'media_count': len(proof_media),
+        })
+
 
 class TechnicianLocationHistoryViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = TechnicianLocationHistory.objects.select_related('technician')
+    queryset = TechnicianLocationHistory.objects.select_related('technician').order_by('-timestamp', '-id')
     serializer_class = TechnicianLocationHistorySerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_permissions(self):
         if self.action == 'update_location':
             return [IsTechnician()]
+        if self.action in ['list', 'retrieve']:
+            if self.request.user.role == 'technician':
+                return [IsTechnician()]
+            return [CanViewSupervisorTracking()]
         if self.action in ['nearby_technicians', 'all_technicians_locations']:
-            return [IsAdminOrSupervisor()]
-        return [IsAdminOrSupervisorOrTechnician()]
+            return [CanViewSupervisorTracking()]
+        return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
         user = self.request.user
-        if user.role in ['admin', 'supervisor']:
+        if is_admin_workspace_role(user.role) or user.role == 'supervisor':
             return self.queryset
         if user.role == 'technician':
             return self.queryset.filter(technician=user)
@@ -1778,7 +2473,7 @@ class TechnicianLocationHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 # GIS Dashboard View
 class GISDashboardView(viewsets.ViewSet):
     """Geographic Information System (GIS) Dashboard - Mapping component for visualizing geographic service data."""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
     
     @action(detail=False, methods=['get'])
     def dashboard_data(self, request):
@@ -1866,7 +2561,8 @@ class ServiceAnalyticsViewSet(viewsets.ModelViewSet):
     """Descriptive Analytics - Summarization and analysis of historical service data for operational performance evaluation."""
     queryset = ServiceAnalytics.objects.all()
     serializer_class = ServiceAnalyticsSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
+    http_method_names = ['get', 'head', 'options']
     
     @action(detail=False, methods=['get'])
     def dashboard_metrics(self, request):
@@ -1937,7 +2633,8 @@ class ServiceAnalyticsViewSet(viewsets.ModelViewSet):
 class TechnicianPerformanceViewSet(viewsets.ModelViewSet):
     queryset = TechnicianPerformance.objects.all()
     serializer_class = TechnicianPerformanceSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisorOrTechnician]
+    http_method_names = ['get', 'head', 'options']
     
     def get_queryset(self):
         user = self.request.user
@@ -1967,7 +2664,11 @@ class DemandForecastViewSet(viewsets.ModelViewSet):
     """Demand Forecasting - Estimation of future service demand using AI and historical data analysis."""
     queryset = DemandForecast.objects.all()
     serializer_class = DemandForecastSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
+    http_method_names = ['get', 'post', 'head', 'options']
+
+    def create(self, request, *args, **kwargs):
+        raise MethodNotAllowed('POST')
     
     @action(detail=False, methods=['post'])
     def generate_forecast(self, request):
@@ -2058,12 +2759,13 @@ class DemandForecastViewSet(viewsets.ModelViewSet):
 class ServiceTrendViewSet(viewsets.ModelViewSet):
     queryset = ServiceTrend.objects.all()
     serializer_class = ServiceTrendSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
+    http_method_names = ['get', 'head', 'options']
 
 
 class StatusReportsViewSet(viewsets.ViewSet):
     """Status reports for various operational aspects"""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
 
     @action(detail=False, methods=['get'])
     def scheduling_dispatch_report(self, request):
@@ -2763,7 +3465,7 @@ class StatusReportsViewSet(viewsets.ViewSet):
 
 class CoverageHeatmapViewSet(viewsets.ViewSet):
     """Coverage Heatmap - GIS-based visualization showing areas with high concentrations of past service requests."""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAdminOrSupervisor]
 
     @action(detail=False, methods=['get'])
     def service_density(self, request):
@@ -2826,6 +3528,154 @@ class CoverageHeatmapViewSet(viewsets.ViewSet):
         return Response({
             'coverage_areas': coverage_areas,
             'total_technicians': len(coverage_areas)
+        })
+
+    @action(detail=False, methods=['get'])
+    def completed_jobs(self, request):
+        """Return all completed jobs with location and checklist data for history/heatmap page."""
+        from users.rbac import (
+            is_superadmin_role, user_has_capability,
+            ADMIN_JOB_HISTORY_VIEW, AFTER_SALES_VIEW_CAPABILITIES,
+            user_has_any_capability,
+        )
+
+        user = request.user
+        role = getattr(user, 'role', '')
+
+        # Access control: superadmin always, follow_up always, admin with capability
+        has_access = (
+            is_superadmin_role(role)
+            or role == 'follow_up'
+            or (role == 'admin' and user_has_capability(user, ADMIN_JOB_HISTORY_VIEW))
+        )
+        if not has_access:
+            return Response(
+                {'detail': 'You do not have permission to view job history.'},
+                status=403,
+            )
+
+        # Build queryset
+        tickets = ServiceTicket.objects.filter(
+            status='Completed'
+        ).select_related(
+            'request__service_type',
+            'request__client',
+            'request__location',
+            'technician',
+        ).prefetch_related('inspection')
+
+        # Filters
+        days = request.query_params.get('days')
+        if days:
+            start_date = timezone.now().date() - timezone.timedelta(days=int(days))
+            tickets = tickets.filter(
+                Q(completed_date__date__gte=start_date) | Q(scheduled_date__gte=start_date)
+            )
+
+        service_type_id = request.query_params.get('service_type')
+        if service_type_id:
+            tickets = tickets.filter(request__service_type_id=service_type_id)
+
+        technician_id = request.query_params.get('technician')
+        if technician_id:
+            tickets = tickets.filter(technician_id=technician_id)
+
+        search = request.query_params.get('search', '').strip()
+        if search:
+            tickets = tickets.filter(
+                Q(request__client__username__icontains=search)
+                | Q(request__client__first_name__icontains=search)
+                | Q(request__client__last_name__icontains=search)
+                | Q(request__service_type__name__icontains=search)
+                | Q(request__location__address__icontains=search)
+                | Q(request__location__city__icontains=search)
+                | Q(technician__username__icontains=search)
+                | Q(technician__first_name__icontains=search)
+            )
+
+        tickets = tickets.order_by('-completed_date', '-scheduled_date')
+
+        # Build response
+        results = []
+        for ticket in tickets:
+            req = ticket.request
+            loc = getattr(req, 'location', None)
+            tech = ticket.technician
+
+            # Checklist / inspection data
+            inspection = None
+            try:
+                insp = ticket.inspection
+                inspection = {
+                    'is_completed': insp.is_completed,
+                    'site_accessible': insp.site_accessible,
+                    'electrical_available': insp.electrical_available,
+                    'electrical_adequate': insp.electrical_adequate,
+                    'safety_equipment_present': insp.safety_equipment_present,
+                    'roof_condition': insp.roof_condition,
+                    'recommendation': insp.recommendation,
+                    'maintenance_required': insp.maintenance_required,
+                    'maintenance_profile': insp.maintenance_profile,
+                    'maintenance_interval_days': insp.maintenance_interval_days,
+                    'maintenance_notes': insp.maintenance_notes,
+                    'warranty_provided': insp.warranty_provided,
+                    'warranty_period_days': insp.warranty_period_days,
+                    'warranty_notes': insp.warranty_notes,
+                    'follow_up_required': insp.follow_up_required,
+                    'follow_up_case_type': insp.follow_up_case_type,
+                    'follow_up_summary': insp.follow_up_summary,
+                    'follow_up_due_date': str(insp.follow_up_due_date) if insp.follow_up_due_date else None,
+                    'proof_media_count': len(insp.proof_media) if insp.proof_media else 0,
+                    'additional_notes': insp.additional_notes,
+                    'safety_hazards': insp.safety_hazards,
+                    'structural_assessment': insp.structural_assessment,
+                }
+            except InspectionChecklist.DoesNotExist:
+                pass
+
+            results.append({
+                'id': ticket.id,
+                'ticket_id': ticket.id,
+                'client': f"{req.client.first_name} {req.client.last_name}".strip() or req.client.username,
+                'client_username': req.client.username,
+                'technician': f"{tech.first_name} {tech.last_name}".strip() or tech.username if tech else 'Unassigned',
+                'technician_username': tech.username if tech else None,
+                'service_type': req.service_type.name if req.service_type else 'Unknown',
+                'service_type_id': req.service_type_id,
+                'priority': ticket.priority,
+                'status': ticket.status,
+                'scheduled_date': str(ticket.scheduled_date) if ticket.scheduled_date else None,
+                'completed_date': str(ticket.completed_date) if ticket.completed_date else None,
+                'address': loc.address if loc else '',
+                'city': loc.city if loc else '',
+                'province': loc.province if loc else '',
+                'latitude': float(loc.latitude) if loc and loc.latitude else None,
+                'longitude': float(loc.longitude) if loc and loc.longitude else None,
+                'client_rating': ticket.client_rating,
+                'completion_proof_images': ticket.completion_proof_images or [],
+                'completion_notes': ticket.completion_notes,
+                'inspection': inspection,
+            })
+
+        # Aggregate stats
+        unique_locations = len({
+            f"{r['latitude']:.4f},{r['longitude']:.4f}"
+            for r in results if r['latitude'] and r['longitude']
+        })
+        service_types_served = len({r['service_type'] for r in results})
+        jobs_with_checklist = sum(1 for r in results if r['inspection'])
+        jobs_with_warranty = sum(
+            1 for r in results
+            if r['inspection'] and r['inspection'].get('warranty_provided')
+        )
+
+        return Response({
+            'total': len(results),
+            'unique_locations': unique_locations,
+            'service_types_served': service_types_served,
+            'jobs_with_checklist': jobs_with_checklist,
+            'jobs_with_warranty': jobs_with_warranty,
+            'results': results,
         })
 
 

@@ -1,7 +1,10 @@
+from unittest.mock import patch
+
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
+from notifications.firebase_utils import send_team_notification
 from notifications.models import FirebaseToken, Notification
 from users.models import User
 
@@ -113,6 +116,17 @@ class NotificationViewSetTests(APITestCase):
         self.assertIsNotNone(first.read_at)
         self.assertIsNotNone(second.read_at)
 
+    def test_user_cannot_create_notification_via_api(self):
+        response = self.client.post('/api/notifications/', {
+            'user': self.other_user.id,
+            'title': 'Spoofed notification',
+            'message': 'This should not be created',
+            'type': 'warning',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertFalse(Notification.objects.filter(title='Spoofed notification').exists())
+
     def test_register_reassigns_existing_browser_token_to_current_user(self):
         FirebaseToken.objects.create(
             user=self.other_user,
@@ -136,3 +150,56 @@ class NotificationViewSetTests(APITestCase):
         token = FirebaseToken.objects.get(fcm_token='shared-browser-token')
         self.assertEqual(token.user, self.user)
         self.assertTrue(token.is_active)
+
+
+class NotificationUtilityTests(APITestCase):
+    def setUp(self):
+        self.tech_one = User.objects.create_user(
+            username='tech_one',
+            email='tech-one@example.com',
+            password='Password123!',
+            role='technician'
+        )
+        self.tech_two = User.objects.create_user(
+            username='tech_two',
+            email='tech-two@example.com',
+            password='Password123!',
+            role='technician'
+        )
+        self.client_user = User.objects.create_user(
+            username='client_one',
+            email='client-one@example.com',
+            password='Password123!',
+            role='client'
+        )
+
+    @patch('notifications.firebase_utils.send_push_notification', return_value=True)
+    def test_send_team_notification_creates_one_notification_per_recipient(self, mock_send_push):
+        result = send_team_notification(
+            'Team Task',
+            'Please review the new job assignment.',
+            role='technician',
+            notification_type='ticket_assigned',
+            data={
+                'action': 'view_job',
+                'job_id': 42,
+            },
+        )
+
+        notifications = Notification.objects.filter(title='Team Task')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['recipient_count'], 2)
+        self.assertEqual(notifications.count(), 2)
+        self.assertSetEqual(
+            set(notifications.values_list('user_id', flat=True)),
+            {self.tech_one.id, self.tech_two.id},
+        )
+        self.assertEqual(mock_send_push.call_count, 2)
+
+    def test_send_team_notification_requires_a_selector(self):
+        with self.assertRaises(ValueError):
+            send_team_notification(
+                'Unsafe Broadcast',
+                'This should not go to everyone by accident.',
+            )

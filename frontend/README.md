@@ -6,38 +6,44 @@ Enterprise front-end for AFN Solar Power Engineering Services.
 - React + Vite
 - TailwindCSS
 - React Router
-- Axios (mock API)
+- Axios (Django REST API)
 - Leaflet (GIS map)
 - React Icons
+- Firebase Cloud Messaging
 
 ## Features
 - Role-based screens: admin / supervisor / technician / client
 - Routing: `/admin/dashboard`, `/supervisor/dashboard`, `/technician/dashboard`, `/client/dashboard`
 - Reusable layout (sidebar + topbar + content)
-- Mock data, service tickets, dispatch, tracking, job updates
+- Live service requests, dispatch, tracking, job updates, and admin settings
 - Leaflet map with technicians + service locations
 
 ## Start
 ```bash
-cd d:\tryfrontend
+cd frontend
 npm install
 npm run dev
 ```
 
 Open `http://localhost:5173`.
 
-## Demo logins
-- Role: `admin`, `supervisor`, `technician`, `client`
-- Username: any value
+Run the Django API separately from the repository root:
+
+```bash
+cd backend
+python manage.py runserver
+```
+
+## Authentication
+- Use real accounts created through the Django backend.
+- For first-time bootstrap, set `AFN_BOOTSTRAP_ADMIN_PASSWORD` and run `backend/create_admin.py`.
 
 ## Build
 ```bash
 npm run build
 ```
 
-## Further improvements
-- Replace `src/api/mockApi.js` with real API endpoints
-- Add auth + JWT
-- Add charts for analytics and reports
-- Add persistent notification system
-- Add unit/integration tests
+## Production Notes
+- Set the frontend API base URL to your deployed Django API.
+- Configure backend env vars for `SECRET_KEY`, `ALLOWED_HOSTS`, CORS, database, Firebase, and OpenRouteService.
+- Keep demo seed commands out of production environments.

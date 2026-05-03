@@ -28,6 +28,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             'email_sent', 'sms_sent', 'push_sent', 'created_at', 'read_at'
         ]
         read_only_fields = [
+            'user', 'ticket', 'request', 'status',
             'created_at', 'read_at', 'email_sent', 'sms_sent',
             'push_sent', 'related_ticket', 'related_request', 'priority'
         ]

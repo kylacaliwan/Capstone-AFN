@@ -10,6 +10,13 @@ from .models import InspectionChecklist, MaintenanceSchedule, ServiceTicket
 
 
 DEFAULT_FOLLOW_UP_WINDOW_DAYS = 14
+COMPLETION_FOLLOW_UP_DEFAULT_OFFSETS = {
+    'complaint': 1,
+    'revisit': 2,
+    'warranty': 3,
+    'feedback': 3,
+    'follow_up': 2,
+}
 
 MAINTENANCE_RULES = {
     'commercial_area': {
@@ -229,6 +236,120 @@ def sync_maintenance_schedule(ticket, reference_date=None):
     return schedule
 
 
+def _build_completion_follow_up_summary(ticket, case_type):
+    service_name = ticket.request.service_type.name if ticket.request.service_type else 'service'
+    summary_map = {
+        'follow_up': f'Post-service follow-up for ticket #{ticket.id}',
+        'complaint': f'Complaint review needed for ticket #{ticket.id}',
+        'warranty': f'Warranty handoff needed for ticket #{ticket.id}',
+        'revisit': f'Revisit needed for ticket #{ticket.id}',
+        'feedback': f'Capture customer feedback for ticket #{ticket.id}',
+    }
+    return summary_map.get(case_type, f'After-sales handoff for {service_name} ticket #{ticket.id}')
+
+
+def _build_completion_follow_up_details(ticket, inspection, case_type):
+    details = []
+
+    if inspection.follow_up_details:
+        details.append(str(inspection.follow_up_details).strip())
+    if inspection.additional_notes:
+        details.append(f"Technician notes: {str(inspection.additional_notes).strip()}")
+    if case_type == 'warranty' and inspection.warranty_notes:
+        details.append(f"Warranty notes: {str(inspection.warranty_notes).strip()}")
+    if inspection.maintenance_required and inspection.maintenance_notes:
+        details.append(f"Maintenance context: {str(inspection.maintenance_notes).strip()}")
+
+    return "\n\n".join(item for item in details if item)
+
+
+def _default_completion_follow_up_due_date(ticket, case_type, reference_date):
+    if case_type == 'warranty' and ticket.warranty_end_date:
+        return ticket.warranty_end_date
+
+    offset_days = COMPLETION_FOLLOW_UP_DEFAULT_OFFSETS.get(case_type, 2)
+    return reference_date + timedelta(days=offset_days)
+
+
+def _notify_completion_follow_up_case(case, *, created):
+    User = get_user_model()
+    recipients = User.objects.filter(role='follow_up', status='active').order_by('id')
+    action = 'New' if created else 'Updated'
+    message = f"{action} after-sales handoff for ticket #{case.service_ticket_id}: {case.summary}"
+
+    for recipient in recipients:
+        Notification.objects.create(
+            user=recipient,
+            ticket=case.service_ticket,
+            request=case.service_ticket.request,
+            message=message,
+            type='info',
+        )
+
+
+def sync_completion_follow_up_case(ticket, reference_date=None):
+    if ticket.status != 'Completed':
+        return None
+
+    try:
+        inspection = ticket.inspection
+    except InspectionChecklist.DoesNotExist:
+        return None
+
+    if not inspection.follow_up_required:
+        return None
+
+    reference_date = reference_date or timezone.localdate()
+    case_type = inspection.follow_up_case_type or 'follow_up'
+    if case_type == 'maintenance':
+        return None
+
+    if case_type == 'warranty' and ticket.warranty_status != 'active':
+        case_type = 'follow_up'
+
+    due_date = inspection.follow_up_due_date or _default_completion_follow_up_due_date(
+        ticket,
+        case_type,
+        reference_date,
+    )
+    priority = 'urgent' if case_type in {'complaint', 'revisit'} else 'high' if case_type == 'warranty' else 'normal'
+    requires_revisit = case_type == 'revisit'
+
+    defaults = {
+        'client': ticket.request.client,
+        'created_by': ticket.technician,
+        'priority': priority,
+        'summary': inspection.follow_up_summary or _build_completion_follow_up_summary(ticket, case_type),
+        'details': _build_completion_follow_up_details(ticket, inspection, case_type),
+        'due_date': due_date,
+        'requires_revisit': requires_revisit,
+        'creation_source': 'completion_flow',
+    }
+
+    existing_case = FollowUpCase.objects.filter(
+        service_ticket=ticket,
+        case_type=case_type,
+        creation_source='completion_flow',
+    ).exclude(status__in=['resolved', 'closed']).first()
+
+    if existing_case:
+        for field, value in defaults.items():
+            setattr(existing_case, field, value)
+        existing_case.save(update_fields=[*defaults.keys(), 'updated_at'])
+        _notify_completion_follow_up_case(existing_case, created=False)
+        return existing_case
+
+    case = FollowUpCase.objects.create(
+        service_ticket=ticket,
+        case_type=case_type,
+        status='open',
+        assigned_to=None,
+        **defaults,
+    )
+    _notify_completion_follow_up_case(case, created=True)
+    return case
+
+
 def ensure_maintenance_follow_up_case(schedule):
     case = FollowUpCase.objects.filter(
         service_ticket=schedule.service_ticket,
@@ -251,7 +372,8 @@ def ensure_maintenance_follow_up_case(schedule):
         case.details = details
         case.priority = priority
         case.due_date = schedule.next_due_date
-        case.save(update_fields=['summary', 'details', 'priority', 'due_date', 'updated_at'])
+        case.creation_source = 'maintenance_alert'
+        case.save(update_fields=['summary', 'details', 'priority', 'due_date', 'creation_source', 'updated_at'])
         return case
 
     return FollowUpCase.objects.create(
@@ -261,6 +383,7 @@ def ensure_maintenance_follow_up_case(schedule):
         case_type='maintenance',
         status='open',
         priority=priority,
+        creation_source='maintenance_alert',
         summary=summary,
         details=details,
         due_date=schedule.next_due_date,
@@ -269,7 +392,7 @@ def ensure_maintenance_follow_up_case(schedule):
 
 def _notify_recipients(schedule, stage):
     User = get_user_model()
-    recipients = User.objects.filter(role__in=['admin', 'follow_up']).distinct()
+    recipients = User.objects.filter(role__in=['superadmin', 'admin', 'follow_up']).distinct()
     stage_label = 'due now' if stage == 'due' else 'coming due'
     title = 'Maintenance alert'
     message = (

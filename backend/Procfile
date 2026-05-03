@@ -1,0 +1,1 @@
+web: gunicorn afn_service_management.wsgi

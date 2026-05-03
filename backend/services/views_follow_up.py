@@ -5,7 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
-from users.permissions import IsAdminOrFollowUp
+from users.permissions import CanAccessAfterSales, CanManageAfterSalesCases, IsAdmin
 
 from .maintenance import process_maintenance_alerts
 from .models import AfterSalesCase as FollowUpCase, MaintenanceSchedule, ServiceTicket
@@ -14,7 +14,7 @@ from .serializers import FollowUpCaseSerializer
 
 class FollowUpCaseViewSet(viewsets.ModelViewSet):
     serializer_class = FollowUpCaseSerializer
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrFollowUp]
+    permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = [
         'summary',
@@ -24,6 +24,13 @@ class FollowUpCaseViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ['created_at', 'updated_at', 'due_date', 'status', 'priority']
     ordering = ['-created_at']
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update']:
+            return [permissions.IsAuthenticated(), CanManageAfterSalesCases()]
+        if self.action == 'destroy':
+            return [permissions.IsAuthenticated(), IsAdmin()]
+        return [permissions.IsAuthenticated(), CanAccessAfterSales()]
 
     def get_queryset(self):
         queryset = FollowUpCase.objects.select_related(
@@ -68,6 +75,7 @@ class FollowUpCaseViewSet(viewsets.ModelViewSet):
         serializer.save(
             client=service_ticket.request.client,
             created_by=self.request.user,
+            creation_source='manual',
             assigned_to=assigned_to or (self.request.user if self.request.user.role == 'follow_up' else assigned_to),
             due_date=serializer.validated_data.get('due_date') or (
                 service_ticket.warranty_end_date if case_type == 'warranty' else serializer.validated_data.get('due_date')

@@ -22,6 +22,18 @@ class MessageApiTests(APITestCase):
             role='technician',
             phone='+639170000002',
         )
+        self.supervisor_user = User.objects.create_user(
+            username='message-supervisor',
+            password='Password123!',
+            role='supervisor',
+            phone='+639170000003',
+        )
+        self.outsider_user = User.objects.create_user(
+            username='message-outsider',
+            password='Password123!',
+            role='client',
+            phone='+639170000004',
+        )
         self.service_type = ServiceType.objects.create(
             name='Message Test Service',
             description='Message flow',
@@ -45,6 +57,7 @@ class MessageApiTests(APITestCase):
         self.ticket = ServiceTicket.objects.create(
             request=self.request_obj,
             technician=self.technician_user,
+            supervisor=self.supervisor_user,
             scheduled_date=timezone.localdate(),
             status='Not Started',
             priority='Normal',
@@ -87,3 +100,34 @@ class MessageApiTests(APITestCase):
         self.assertEqual(message.sender, self.client_user)
         self.assertEqual(message.receiver, self.technician_user)
         self.assertEqual(message.message_text, 'Client reply message')
+
+    def test_create_message_rejects_receiver_outside_ticket_thread(self):
+        response = self.client.post(
+            '/api/messages/',
+            {
+                'ticket': self.ticket.id,
+                'receiver': self.outsider_user.id,
+                'text': 'This should not be allowed',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('receiver', response.data)
+
+    def test_create_message_rejects_sender_outside_ticket_thread(self):
+        outsider_token = Token.objects.create(user=self.outsider_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {outsider_token.key}')
+
+        response = self.client.post(
+            '/api/messages/',
+            {
+                'ticket': self.ticket.id,
+                'receiver': self.client_user.id,
+                'text': 'This should not be allowed either',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('non_field_errors', response.data)

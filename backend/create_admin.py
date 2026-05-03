@@ -1,76 +1,92 @@
 #!/usr/bin/env python
 """
-Script to create test users for AFN Service Management
+Bootstrap the single superadmin owner account using environment variables.
+
+Required:
+    AFN_BOOTSTRAP_ADMIN_PASSWORD
+
+Optional:
+    AFN_BOOTSTRAP_ADMIN_USERNAME (default: admin)
+    AFN_BOOTSTRAP_ADMIN_EMAIL (default: admin@example.com)
+    AFN_BOOTSTRAP_ADMIN_FIRST_NAME (default: System)
+    AFN_BOOTSTRAP_ADMIN_LAST_NAME (default: Administrator)
 """
 import os
 import sys
+from pathlib import Path
+
 import django
 
-# Add the project directory to the Python path
-sys.path.append(r'd:\CAPSTONE\afn_service_management')
+
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.append(str(BASE_DIR))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'afn_service_management.settings')
 
-# Setup Django
 django.setup()
 
-from users.models import User
+from users.models import User  # noqa: E402
 
-# Test users data
-test_users = [
-    {
-        'username': 'admin',
-        'email': 'admin@afn.com',
-        'password': 'admin123',
-        'role': 'admin',
-        'first_name': 'System',
-        'last_name': 'Administrator'
-    },
-    {
-        'username': 'supervisor1',
-        'email': 'supervisor@afn.com',
-        'password': 'super123',
-        'role': 'supervisor',
-        'first_name': 'John',
-        'last_name': 'Supervisor'
-    },
-    {
-        'username': 'tech1',
-        'email': 'tech1@afn.com',
-        'password': 'tech123',
-        'role': 'technician',
-        'first_name': 'Mike',
-        'last_name': 'Technician',
-        'phone': '+1234567890'
-    },
-    {
-        'username': 'client1',
-        'email': 'client1@afn.com',
-        'password': 'client123',
-        'role': 'client',
-        'first_name': 'Alice',
-        'last_name': 'Client',
-        'phone': '+1234567892'
-    }
-]
 
-for user_data in test_users:
-    if not User.objects.filter(username=user_data['username']).exists():
-        user = User.objects.create_user(
-            username=user_data['username'],
-            email=user_data['email'],
-            password=user_data['password'],
-            role=user_data['role'],
-            first_name=user_data.get('first_name', ''),
-            last_name=user_data.get('last_name', ''),
-            phone=user_data.get('phone', '')
+def main():
+    username = os.environ.get('AFN_BOOTSTRAP_ADMIN_USERNAME', 'admin').strip() or 'admin'
+    email = os.environ.get('AFN_BOOTSTRAP_ADMIN_EMAIL', 'admin@example.com').strip() or 'admin@example.com'
+    password = os.environ.get('AFN_BOOTSTRAP_ADMIN_PASSWORD', '').strip()
+    first_name = os.environ.get('AFN_BOOTSTRAP_ADMIN_FIRST_NAME', 'System').strip()
+    last_name = os.environ.get('AFN_BOOTSTRAP_ADMIN_LAST_NAME', 'Administrator').strip()
+
+    if not password:
+        raise SystemExit('Set AFN_BOOTSTRAP_ADMIN_PASSWORD before running this script.')
+
+    existing_owner = User.objects.filter(role='superadmin').exclude(username=username).first()
+    if existing_owner:
+        raise SystemExit(
+            f"Superadmin '{existing_owner.username}' already exists. "
+            f"Use that account or promote a different owner manually."
         )
-        print(f"Created user: {user.username} ({user.role})")
-    else:
-        print(f"User already exists: {user_data['username']}")
 
-print("\nTest Login Credentials:")
-print("Admin: admin / admin123")
-print("Supervisor: supervisor1 / super123")
-print("Technician: tech1 / tech123")
-print("Client: client1 / client123")
+    user, created = User.objects.get_or_create(
+        username=username,
+        defaults={
+            'email': email,
+            'role': 'superadmin',
+            'is_staff': True,
+            'is_superuser': True,
+            'first_name': first_name,
+            'last_name': last_name,
+            'status': 'active',
+        },
+    )
 
+    updated_fields = []
+    if user.email != email:
+        user.email = email
+        updated_fields.append('email')
+    if user.role != 'superadmin':
+        user.role = 'superadmin'
+        updated_fields.append('role')
+    if not user.is_staff:
+        user.is_staff = True
+        updated_fields.append('is_staff')
+    if not user.is_superuser:
+        user.is_superuser = True
+        updated_fields.append('is_superuser')
+    if user.first_name != first_name:
+        user.first_name = first_name
+        updated_fields.append('first_name')
+    if user.last_name != last_name:
+        user.last_name = last_name
+        updated_fields.append('last_name')
+    if user.status != 'active':
+        user.status = 'active'
+        updated_fields.append('status')
+
+    user.set_password(password)
+    updated_fields.append('password')
+    user.save(update_fields=updated_fields)
+
+    action = 'Created' if created else 'Updated'
+    print(f"{action} superadmin user '{username}'.")
+
+
+if __name__ == '__main__':
+    main()

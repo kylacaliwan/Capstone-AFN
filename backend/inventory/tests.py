@@ -34,6 +34,15 @@ class AutoInventoryWorkflowTests(APITestCase):
             current_latitude='14.560000',
             current_longitude='121.020000',
         )
+        self.crew_technician = User.objects.create_user(
+            username='inventory-crew-tech',
+            password='pass',
+            role='technician',
+            status='active',
+            is_available=True,
+            current_latitude='14.561000',
+            current_longitude='121.021000',
+        )
         self.category = InventoryCategory.objects.create(
             name='Service Parts',
             description='Default service parts',
@@ -108,6 +117,25 @@ class AutoInventoryWorkflowTests(APITestCase):
                 transaction_type='reservation',
             ).count(),
             1,
+        )
+
+    def test_assigning_ticket_with_crew_keeps_inventory_reserved_under_lead(self):
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.post(
+            f'/api/services/service-tickets/{self.ticket.id}/assign/',
+            {
+                'technician_id': self.technician_user.id,
+                'crew_ids': [self.crew_technician.id],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        reservation = InventoryReservation.objects.get(service_ticket=self.ticket)
+
+        self.assertEqual(reservation.technician, self.technician_user)
+        self.assertTrue(
+            self.ticket.crew_assignments.filter(technician=self.crew_technician).exists()
         )
 
     def test_cancelling_request_releases_reserved_inventory(self):

@@ -1,0 +1,11 @@
+{
+  "name": "capstone-full-stack",
+  "version": "1.0.0",
+  "description": "Unified AFN Service Management Dashboard",
+  "scripts": {
+    "build": "cd ./frontend && npm install && npm run build && cd .. && mv frontend/dist dist || true",
+    "build:pythonanywhere": "cd ./frontend && npm install && npm run build:pythonanywhere",
+    "dev": "cd frontend && npm run dev"
+  },
+  "private": true
+}

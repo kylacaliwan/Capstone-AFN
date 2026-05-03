@@ -1,11 +1,30 @@
+import re
+
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 from django.contrib.auth.hashers import identify_hasher
+from django.core.cache import cache
+from django.core import mail
+from django.test import override_settings
 from django.utils import timezone
 
 from services.models import ServiceLocation, ServiceRequest, ServiceTicket, ServiceType, TechnicianSkill
-from .models import User
+from .models import AdminSettings, User, UserCapabilityGrant
+from .rbac import (
+    AFTER_SALES_CASES_MANAGE,
+    AFTER_SALES_CASES_VIEW,
+    AFTER_SALES_DASHBOARD_VIEW,
+    MANAGE_STAFF_CAPABILITIES,
+    TECHNICIAN_DASHBOARD_VIEW,
+    TECHNICIAN_JOBS_VIEW,
+    TECHNICIAN_PROFILE_VIEW,
+    USER_DIRECTORY_VIEW,
+    can_receive_delegated_authority,
+    get_default_admin_scope_for_role,
+    is_admin_scoped_role,
+    is_admin_workspace_role,
+)
 
 
 class UserRegistrationTests(APITestCase):
@@ -53,14 +72,14 @@ class UserRegistrationTests(APITestCase):
         new_admin = User.objects.get(username='admin2')
         self.assertEqual(new_admin.role, 'client')
 
-    def test_admin_user_can_create_additional_admin(self):
-        admin_user = User.objects.create_user(
-            username='existing_admin',
-            email='existing_admin@example.com',
+    def test_superadmin_user_can_create_additional_admin(self):
+        superadmin_user = User.objects.create_user(
+            username='existing_owner',
+            email='existing_owner@example.com',
             password='Password123!',
-            role='admin'
+            role='superadmin'
         )
-        token = Token.objects.create(user=admin_user)
+        token = Token.objects.create(user=superadmin_user)
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
 
         payload = {
@@ -77,14 +96,14 @@ class UserRegistrationTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(User.objects.get(username='admin3').role, 'admin')
 
-    def test_admin_user_can_create_follow_up_user(self):
-        admin_user = User.objects.create_user(
-            username='existing_admin_two',
-            email='existing_admin_two@example.com',
+    def test_superadmin_user_can_create_follow_up_user(self):
+        superadmin_user = User.objects.create_user(
+            username='existing_owner_two',
+            email='existing_owner_two@example.com',
             password='Password123!',
-            role='admin'
+            role='superadmin'
         )
-        token = Token.objects.create(user=admin_user)
+        token = Token.objects.create(user=superadmin_user)
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
 
         payload = {
@@ -103,12 +122,12 @@ class UserRegistrationTests(APITestCase):
         self.assertEqual(user.role, 'follow_up')
         self.assertEqual(user.admin_scope, 'service_follow_up')
 
-    def test_admin_user_can_deactivate_user(self):
-        admin_user = User.objects.create_user(
-            username='existing_admin',
-            email='existing_admin@example.com',
+    def test_superadmin_user_can_deactivate_user(self):
+        superadmin_user = User.objects.create_user(
+            username='existing_owner_three',
+            email='existing_owner_three@example.com',
             password='Password123!',
-            role='admin'
+            role='superadmin'
         )
         managed_user = User.objects.create_user(
             username='tech_user',
@@ -116,7 +135,7 @@ class UserRegistrationTests(APITestCase):
             password='Password123!',
             role='technician'
         )
-        token = Token.objects.create(user=admin_user)
+        token = Token.objects.create(user=superadmin_user)
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
 
         response = self.client.delete(f'/api/admin/users/{managed_user.id}/')
@@ -126,10 +145,55 @@ class UserRegistrationTests(APITestCase):
         self.assertEqual(managed_user.status, 'inactive')
         self.assertFalse(managed_user.is_active)
 
+    def test_admin_user_cannot_create_internal_user(self):
+        admin_user = User.objects.create_user(
+            username='operations_admin',
+            email='operations_admin@example.com',
+            password='Password123!',
+            role='admin'
+        )
+        token = Token.objects.create(user=admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.post(self.user_create_url, {
+            'username': 'blocked_supervisor',
+            'email': 'blocked_supervisor@example.com',
+            'password': 'Password123!',
+            'password_confirm': 'Password123!',
+            'role': 'supervisor'
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(User.objects.filter(username='blocked_supervisor').exists())
+
+    def test_public_registration_rejects_weak_password(self):
+        payload = {
+            'username': 'weak_password_user',
+            'email': 'weak@example.com',
+            'password': '123',
+            'password_confirm': '123',
+            'role': 'client',
+        }
+
+        response = self.client.post(self.register_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('password', response.data)
+        self.assertFalse(User.objects.filter(username='weak_password_user').exists())
+
+
+class RoleClassificationTests(APITestCase):
+    def test_follow_up_is_admin_scoped_but_not_full_admin_workspace(self):
+        self.assertTrue(is_admin_scoped_role('follow_up'))
+        self.assertTrue(can_receive_delegated_authority('follow_up'))
+        self.assertFalse(is_admin_workspace_role('follow_up'))
+        self.assertEqual(get_default_admin_scope_for_role('follow_up'), 'service_follow_up')
+
 
 class UserLoginTests(APITestCase):
     def setUp(self):
         self.login_url = '/api/users/login/'
+        cache.clear()
 
     def test_user_can_login_with_email(self):
         user = User.objects.create_user(
@@ -207,6 +271,93 @@ class UserLoginTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['user']['username'], user.username)
+
+    @override_settings(PASSWORD_HASHERS=['django.contrib.auth.hashers.MD5PasswordHasher'])
+    def test_login_is_rate_limited_after_too_many_attempts(self):
+        User.objects.create_user(
+            username='throttle_user',
+            email='throttle@example.com',
+            password='Password123!',
+            role='client'
+        )
+
+        for _ in range(10):
+            response = self.client.post(self.login_url, {
+                'username': 'throttle_user',
+                'password': 'wrong-password'
+            }, format='json')
+            self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        response = self.client.post(self.login_url, {
+            'username': 'throttle_user',
+            'password': 'wrong-password'
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+@override_settings(
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    FRONTEND_BASE_URL='http://localhost:5173',
+)
+class PasswordResetTests(APITestCase):
+    def setUp(self):
+        self.request_url = '/api/users/password_reset_request/'
+        self.confirm_url = '/api/users/password_reset_confirm/'
+        self.user = User.objects.create_user(
+            username='reset_user',
+            email='reset-user@example.com',
+            password='Password123!',
+            role='client'
+        )
+        cache.clear()
+
+    def _extract_reset_credentials(self, body):
+        match = re.search(r'uid=([^&\s]+)&token=([^\s]+)', body)
+        self.assertIsNotNone(match)
+        return match.group(1), match.group(2)
+
+    def test_password_reset_request_sends_email_with_reset_link(self):
+        response = self.client.post(self.request_url, {
+            'identifier': self.user.email
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn(self.user.username, mail.outbox[0].body)
+        self.assertIn('/reset-password?uid=', mail.outbox[0].body)
+        self.assertIn('token=', mail.outbox[0].body)
+
+    def test_password_reset_confirm_updates_password_and_revokes_existing_tokens(self):
+        existing_token = Token.objects.create(user=self.user)
+
+        self.client.post(self.request_url, {
+            'identifier': self.user.email
+        }, format='json')
+        uid, token = self._extract_reset_credentials(mail.outbox[0].body)
+
+        response = self.client.post(self.confirm_url, {
+            'uid': uid,
+            'token': token,
+            'new_password': 'EvenStrongerPassword456!',
+            'password_confirm': 'EvenStrongerPassword456!',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('EvenStrongerPassword456!'))
+        self.assertFalse(Token.objects.filter(key=existing_token.key).exists())
+
+    def test_password_reset_confirm_rejects_invalid_token(self):
+        response = self.client.post(self.confirm_url, {
+            'uid': 'invalid',
+            'token': 'invalid-token',
+            'new_password': 'EvenStrongerPassword456!',
+            'password_confirm': 'EvenStrongerPassword456!',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('error', response.data)
 
 
 class SelfServiceProfileTests(APITestCase):
@@ -292,6 +443,17 @@ class SelfServiceProfileTests(APITestCase):
         self.assertEqual(self.technician_user.status, 'active')
         self.assertTrue(self.technician_user.is_available)
 
+    def test_change_password_rejects_weak_password(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.client_token.key}')
+
+        response = self.client.post('/api/users/change_password/', {
+            'current_password': 'Password123!',
+            'new_password': '123',
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('new_password', response.data)
+
 
 class AdminSettingsTests(APITestCase):
     def setUp(self):
@@ -313,6 +475,30 @@ class AdminSettingsTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['success'])
         self.assertEqual(response.data['settings']['systemName'], 'AFN Updated')
+
+    def test_admin_settings_are_persisted_and_returned_on_next_read(self):
+        response = self.client.put('/api/admin/settings/', {
+            'systemName': 'AFN Updated',
+            'supportEmail': 'ops@example.com',
+            'enableNotifications': True,
+            'autoDispatchEnabled': True,
+            'smsNotificationsEnabled': False,
+            'defaultTimeZone': 'Asia/Manila',
+            'maxTechnicianAssignments': 7,
+        }, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        response = self.client.get('/api/admin/settings/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['systemName'], 'AFN Updated')
+        self.assertEqual(response.data['supportEmail'], 'ops@example.com')
+        self.assertEqual(response.data['defaultTimeZone'], 'Asia/Manila')
+        self.assertEqual(response.data['maxTechnicianAssignments'], 7)
+
+        settings_record = AdminSettings.objects.get()
+        self.assertEqual(settings_record.updated_by, self.admin_user)
 
 
 class AdminTechnicianAccessTests(APITestCase):
@@ -364,16 +550,16 @@ class AdminTechnicianAccessTests(APITestCase):
 
 class AdminUserManagementTests(APITestCase):
     def setUp(self):
-        self.admin_user = User.objects.create_user(
-            username='user_mgmt_admin',
-            email='user_mgmt_admin@example.com',
+        self.superadmin_user = User.objects.create_user(
+            username='user_mgmt_owner',
+            email='user_mgmt_owner@example.com',
             password='Password123!',
-            role='admin'
+            role='superadmin'
         )
-        token = Token.objects.create(user=self.admin_user)
+        token = Token.objects.create(user=self.superadmin_user)
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
 
-    def test_admin_can_create_internal_user_with_selected_role(self):
+    def test_superadmin_can_create_internal_user_with_selected_role(self):
         response = self.client.post('/api/admin/users/', {
             'username': 'created_supervisor',
             'email': 'created_supervisor@example.com',
@@ -533,3 +719,195 @@ class AdminAnalyticsTests(APITestCase):
         self.assertEqual(response.data['topRequestedServiceTypes'][0]['serviceType'], self.solar.name)
         self.assertTrue(any(item['city'] == 'Lagos' for item in response.data['cityCompletionTrends']))
         self.assertTrue(any(item['province'] == 'Lagos' for item in response.data['provinceCompletionTrends']))
+
+
+class CapabilityGrantApiTests(APITestCase):
+    def setUp(self):
+        self.superadmin_user = User.objects.create_user(
+            username='cap_superadmin',
+            email='cap_superadmin@example.com',
+            password='Password123!',
+            role='superadmin'
+        )
+        self.admin_user = User.objects.create_user(
+            username='cap_admin',
+            email='cap_admin@example.com',
+            password='Password123!',
+            role='admin'
+        )
+        self.supervisor_user = User.objects.create_user(
+            username='cap_supervisor',
+            email='cap_supervisor@example.com',
+            password='Password123!',
+            role='supervisor'
+        )
+        self.technician_user = User.objects.create_user(
+            username='cap_technician',
+            email='cap_technician@example.com',
+            password='Password123!',
+            role='technician'
+        )
+        self.other_admin = User.objects.create_user(
+            username='cap_admin_peer',
+            email='cap_admin_peer@example.com',
+            password='Password123!',
+            role='admin'
+        )
+        self.client_user = User.objects.create_user(
+            username='cap_client',
+            email='cap_client@example.com',
+            password='Password123!',
+            role='client'
+        )
+
+    def test_admin_can_grant_direct_capabilities_to_staff(self):
+        token = Token.objects.create(user=self.admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.put(
+            f'/api/users/{self.technician_user.id}/capabilities/',
+            {
+                'capabilities': [
+                    TECHNICIAN_DASHBOARD_VIEW,
+                    TECHNICIAN_JOBS_VIEW,
+                ]
+            },
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            set(UserCapabilityGrant.objects.filter(user=self.technician_user).values_list('capability_code', flat=True)),
+            {TECHNICIAN_DASHBOARD_VIEW, TECHNICIAN_JOBS_VIEW}
+        )
+        self.assertIn(TECHNICIAN_DASHBOARD_VIEW, response.data['effective_capabilities'])
+
+    def test_supervisor_can_only_grant_allowed_staff_capabilities(self):
+        token = Token.objects.create(user=self.supervisor_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.put(
+            f'/api/users/{self.technician_user.id}/capabilities/',
+            {
+                'capabilities': [
+                    TECHNICIAN_PROFILE_VIEW,
+                ]
+            },
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            UserCapabilityGrant.objects.filter(
+                user=self.technician_user,
+                capability_code=TECHNICIAN_PROFILE_VIEW,
+                granted_by=self.supervisor_user,
+            ).exists()
+        )
+
+    def test_supervisor_cannot_manage_admin_capabilities(self):
+        token = Token.objects.create(user=self.supervisor_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get(f'/api/users/{self.other_admin.id}/capabilities/')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_me_endpoint_includes_effective_capabilities(self):
+        UserCapabilityGrant.objects.create(
+            user=self.technician_user,
+            capability_code=AFTER_SALES_CASES_VIEW,
+            granted_by=self.admin_user,
+        )
+        token = Token.objects.create(user=self.technician_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get('/api/users/me/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(AFTER_SALES_CASES_VIEW, response.data['capabilities'])
+
+    def test_available_capabilities_are_scoped_to_the_target_staff_role(self):
+        token = Token.objects.create(user=self.admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get(f'/api/users/{self.technician_user.id}/capabilities/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        available_codes = {item['code'] for item in response.data['available_capabilities']}
+        self.assertIn(TECHNICIAN_DASHBOARD_VIEW, available_codes)
+        self.assertIn(TECHNICIAN_JOBS_VIEW, available_codes)
+        self.assertIn(TECHNICIAN_PROFILE_VIEW, available_codes)
+        self.assertNotIn(AFTER_SALES_DASHBOARD_VIEW, available_codes)
+        self.assertNotIn(MANAGE_STAFF_CAPABILITIES, available_codes)
+
+    def test_direct_staff_capabilities_replace_default_staff_navigation(self):
+        UserCapabilityGrant.objects.create(
+            user=self.technician_user,
+            capability_code=TECHNICIAN_PROFILE_VIEW,
+            granted_by=self.admin_user,
+        )
+        token = Token.objects.create(user=self.technician_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get('/api/users/me/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['capabilities'], [TECHNICIAN_PROFILE_VIEW])
+
+    def test_admin_cannot_manage_client_capabilities(self):
+        token = Token.objects.create(user=self.admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get(f'/api/users/{self.client_user.id}/capabilities/')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_without_directory_capability_cannot_list_users(self):
+        token = Token.objects.create(user=self.admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get('/api/users/')
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_superadmin_can_grant_directory_capability_to_admin(self):
+        token = Token.objects.create(user=self.superadmin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.put(
+            f'/api/users/{self.admin_user.id}/capabilities/',
+            {
+                'capabilities': [
+                    USER_DIRECTORY_VIEW,
+                ]
+            },
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            UserCapabilityGrant.objects.filter(
+                user=self.admin_user,
+                capability_code=USER_DIRECTORY_VIEW,
+                granted_by=self.superadmin_user,
+            ).exists()
+        )
+        self.assertIn(USER_DIRECTORY_VIEW, response.data['effective_capabilities'])
+
+    def test_admin_with_directory_capability_can_list_all_users(self):
+        UserCapabilityGrant.objects.create(
+            user=self.admin_user,
+            capability_code=USER_DIRECTORY_VIEW,
+            granted_by=self.superadmin_user,
+        )
+        token = Token.objects.create(user=self.admin_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        response = self.client.get('/api/users/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        usernames = {item['username'] for item in response.data}
+        self.assertIn(self.admin_user.username, usernames)
+        self.assertIn(self.supervisor_user.username, usernames)
+        self.assertIn(self.client_user.username, usernames)

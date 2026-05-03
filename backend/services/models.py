@@ -61,6 +61,13 @@ class ServiceRequest(models.Model):
     # Auto-ticket will be created when request is approved
     auto_ticket_created = models.BooleanField(default=False)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['client_id', 'status']),
+            models.Index(fields=['status', 'request_date']),
+        ]
+        ordering = ['-request_date']
+
     def __str__(self):
         return f"{self.service_type.name} request by {self.client.username}"
 
@@ -161,12 +168,56 @@ class ServiceTicket(models.Model):
     route_distance = models.FloatField(null=True, blank=True)  # meters
     route_duration = models.FloatField(null=True, blank=True)  # seconds
 
+    # Job completion proof (images)
+    completion_proof_images = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of image URLs uploaded as proof of job completion"
+    )
+    completion_notes = models.TextField(blank=True, null=True)
+    
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True, null=True)
     updated_at = models.DateTimeField(auto_now=True, null=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['status', 'scheduled_date']),
+            models.Index(fields=['technician_id', 'status']),
+            models.Index(fields=['status', 'created_at']),
+            models.Index(fields=['auto_assigned', 'assigned_at']),
+        ]
+        ordering = ['-created_at']
+
     def __str__(self):
         return f"Ticket {self.id} for {self.request}"
+
+
+class TicketCrewAssignment(models.Model):
+    ticket = models.ForeignKey(
+        ServiceTicket,
+        on_delete=models.CASCADE,
+        related_name='crew_assignments',
+    )
+    technician = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='crew_ticket_assignments',
+        limit_choices_to={'role': 'technician'},
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at', 'id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['ticket', 'technician'],
+                name='unique_ticket_crew_assignment',
+            )
+        ]
+
+    def __str__(self):
+        return f"Ticket #{self.ticket_id} crew: {self.technician.username}"
 
 
 class AfterSalesCase(models.Model):
@@ -191,6 +242,11 @@ class AfterSalesCase(models.Model):
         ('normal', 'Normal'),
         ('high', 'High'),
         ('urgent', 'Urgent'),
+    ]
+    CREATION_SOURCE_CHOICES = [
+        ('manual', 'Manual'),
+        ('completion_flow', 'Completion Flow'),
+        ('maintenance_alert', 'Maintenance Alert'),
     ]
 
     service_ticket = models.ForeignKey(ServiceTicket, on_delete=models.CASCADE, related_name='after_sales_cases')
@@ -218,6 +274,11 @@ class AfterSalesCase(models.Model):
     case_type = models.CharField(max_length=20, choices=CASE_TYPE_CHOICES, default='follow_up')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
     priority = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='normal')
+    creation_source = models.CharField(
+        max_length=30,
+        choices=CREATION_SOURCE_CHOICES,
+        default='manual',
+    )
     summary = models.CharField(max_length=255)
     details = models.TextField(blank=True, null=True)
     resolution_notes = models.TextField(blank=True, null=True)
@@ -300,6 +361,9 @@ class TechnicianSkill(models.Model):
     service_type = models.ForeignKey(ServiceType, on_delete=models.CASCADE)
     skill_level = models.CharField(max_length=50, choices=SKILL_LEVELS)
 
+    class Meta:
+        unique_together = ('technician', 'service_type')
+
     def __str__(self):
         return f"{self.technician.username} - {self.service_type.name} ({self.skill_level})"
 
@@ -325,6 +389,10 @@ class ServiceStatusHistory(models.Model):
 class InspectionChecklist(models.Model):
     """Digital pre-installation inspection checklist"""
     MAINTENANCE_PROFILE_CHOICES = MaintenanceSchedule.PROFILE_CHOICES
+    FOLLOW_UP_CASE_TYPE_CHOICES = [
+        choice for choice in AfterSalesCase.CASE_TYPE_CHOICES
+        if choice[0] != 'maintenance'
+    ]
 
     ticket = models.OneToOneField(ServiceTicket, on_delete=models.CASCADE, related_name='inspection')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -373,6 +441,16 @@ class InspectionChecklist(models.Model):
     warranty_provided = models.BooleanField(default=False)
     warranty_period_days = models.PositiveIntegerField(blank=True, null=True)
     warranty_notes = models.TextField(blank=True, null=True)
+    follow_up_required = models.BooleanField(default=False)
+    follow_up_case_type = models.CharField(
+        max_length=20,
+        choices=FOLLOW_UP_CASE_TYPE_CHOICES,
+        blank=True,
+        null=True,
+    )
+    follow_up_due_date = models.DateField(blank=True, null=True)
+    follow_up_summary = models.CharField(max_length=255, blank=True, null=True)
+    follow_up_details = models.TextField(blank=True, null=True)
     
     def __str__(self):
         return f"Inspection for Ticket {self.ticket.id}"

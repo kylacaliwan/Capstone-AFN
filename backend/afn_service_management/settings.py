@@ -104,6 +104,9 @@ LOGOUT_REDIRECT_URL = '/'
 # Application definition
 
 INSTALLED_APPS = [
+    # Daphne must be first (before staticfiles)
+    'daphne',
+    
     # Django default apps
     'django.contrib.admin',
     'django.contrib.auth',
@@ -116,7 +119,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
-    # 'channels',  # Temporarily disabled
+    'channels',
 
     # Custom apps
     'users',
@@ -245,7 +248,7 @@ STATICFILES_DIRS = [BASE_DIR / 'static']  # include custom static directory
 STATIC_ROOT = Path(os.environ.get('STATIC_ROOT', str(BASE_DIR / 'staticfiles')))
 
 # Media files
-MEDIA_URL = 'media/'
+MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type
@@ -273,6 +276,13 @@ REST_FRAMEWORK = {
             'rest_framework.renderers.JSONRenderer',
         ]
     ),
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.ScopedRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'login': '10/minute',
+        'password_reset': '5/minute',
+    },
 }
 
 # CORS settings for React frontend — restrict origins in production!
@@ -296,6 +306,9 @@ CORS_ALLOWED_ORIGIN_REGEXES = (
 )
 CORS_ALLOW_CREDENTIALS = env_bool('CORS_ALLOW_CREDENTIALS', default=True)
 CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS', DEFAULT_FRONTEND_ORIGINS)
+FRONTEND_BASE_URL = os.environ.get('FRONTEND_BASE_URL') or (
+    CORS_ALLOWED_ORIGINS[0] if CORS_ALLOWED_ORIGINS else 'http://localhost:5173'
+)
 
 # Email settings (configure for your email provider)
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
@@ -339,3 +352,25 @@ EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in ('true', '1', 'yes')
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+
+# Django Channels configuration for WebSocket support
+ASGI_APPLICATION = 'afn_service_management.asgi.application'
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            'hosts': [('127.0.0.1', 6379)],
+            'capacity': 10000,
+            'expiry': 10 * 60,
+        },
+    }
+}
+
+# Fallback to in-memory layer if Redis is unavailable (development only)
+if not os.environ.get('USE_REDIS', '').lower() in ('true', '1', 'yes'):
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        }
+    }

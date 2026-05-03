@@ -1,0 +1,8 @@
+backend
+node_modules
+.env*
+*.sqlite3
+venv
+.git
+dist
+build

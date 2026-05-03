@@ -1,3 +1,5 @@
+import os
+import secrets
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
@@ -23,11 +25,11 @@ User = get_user_model()
 
 class Command(BaseCommand):
     help = "Create polished capstone demo data for AFN Service Management."
+    PASSWORD_ENV_PREFIX = "AFN_DEMO_PASSWORD_"
 
     USER_FIXTURES = [
         {
             "username": "admin",
-            "password": "admin123",
             "email": "admin@afn.com",
             "role": "admin",
             "first_name": "Ariana",
@@ -37,7 +39,6 @@ class Command(BaseCommand):
         },
         {
             "username": "supervisor1",
-            "password": "super123",
             "email": "supervisor@afn.com",
             "role": "supervisor",
             "first_name": "Carlos",
@@ -47,7 +48,6 @@ class Command(BaseCommand):
         },
         {
             "username": "tech1",
-            "password": "tech123",
             "email": "tech1@afn.com",
             "role": "technician",
             "first_name": "Marco",
@@ -60,7 +60,6 @@ class Command(BaseCommand):
         },
         {
             "username": "tech2",
-            "password": "tech123",
             "email": "tech2@afn.com",
             "role": "technician",
             "first_name": "Lea",
@@ -73,7 +72,6 @@ class Command(BaseCommand):
         },
         {
             "username": "client1",
-            "password": "client123",
             "email": "client1@afn.com",
             "role": "client",
             "first_name": "Mia",
@@ -83,7 +81,6 @@ class Command(BaseCommand):
         },
         {
             "username": "client2",
-            "password": "client123",
             "email": "client2@afn.com",
             "role": "client",
             "first_name": "Julian",
@@ -238,6 +235,8 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         today = timezone.localdate()
+        self.generated_passwords = {}
+        self.env_passwords = {}
 
         self.stdout.write("Seeding polished capstone demo data...")
 
@@ -250,24 +249,41 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS("Capstone demo data is ready."))
         self.stdout.write("")
-        self.stdout.write("Login credentials:")
-        self.stdout.write("Admin: admin / admin123")
-        self.stdout.write("Supervisor: supervisor1 / super123")
-        self.stdout.write("Technicians: tech1 / tech123, tech2 / tech123")
-        self.stdout.write("Clients: client1 / client123, client2 / client123")
+        self.stdout.write("Password summary:")
+        for username in users:
+            if username in self.env_passwords:
+                self.stdout.write(f"{username}: sourced from {self.env_passwords[username]}")
+            elif username in self.generated_passwords:
+                self.stdout.write(f"{username}: generated one-time password {self.generated_passwords[username]}")
+            else:
+                self.stdout.write(f"{username}: existing password preserved")
+
+    def _resolve_password(self, username, created):
+        env_key = f"{self.PASSWORD_ENV_PREFIX}{username.upper()}"
+        env_password = os.environ.get(env_key, "").strip()
+        if env_password:
+            self.env_passwords[username] = env_key
+            return env_password
+
+        if not created:
+            return None
+
+        generated_password = secrets.token_urlsafe(16)
+        self.generated_passwords[username] = generated_password
+        return generated_password
 
     def _seed_users(self):
         users = {}
         for fixture in self.USER_FIXTURES:
             defaults = fixture.copy()
-            password = defaults.pop("password")
             username = defaults.pop("username")
 
             user, created = User.objects.update_or_create(
                 username=username,
                 defaults=defaults,
             )
-            if created or not user.check_password(password):
+            password = self._resolve_password(username, created)
+            if password and (created or not user.check_password(password)):
                 user.set_password(password)
                 user.save(update_fields=["password"])
 

@@ -9,6 +9,11 @@ from .models import (
     TechnicianLocationHistory, ServiceAnalytics, TechnicianPerformance,
     DemandForecast, ServiceTrend
 )
+from .sla import (
+    evaluate_service_request_sla,
+    evaluate_service_ticket_sla,
+    serialize_sla_evaluation,
+)
 
 class ServiceTypeSerializer(serializers.ModelSerializer):
     inventory_requirements_count = serializers.SerializerMethodField()
@@ -33,6 +38,7 @@ class ServiceRequestSerializer(serializers.ModelSerializer):
     location = ServiceLocationSerializer(read_only=True)
     client_name = serializers.CharField(source='client.username', read_only=True)
     service_type_name = serializers.CharField(source='service_type.name', read_only=True)
+    sla = serializers.SerializerMethodField()
     service = serializers.CharField(write_only=True, required=False, allow_blank=True)
     notes = serializers.CharField(write_only=True, required=False, allow_blank=True)
     lat = serializers.CharField(write_only=True, required=False, allow_blank=False)
@@ -219,6 +225,9 @@ class ServiceRequestSerializer(serializers.ModelSerializer):
             )
 
         return instance
+
+    def get_sla(self, obj):
+        return serialize_sla_evaluation(evaluate_service_request_sla(obj))
     
     class Meta:
         model = ServiceRequest
@@ -226,7 +235,7 @@ class ServiceRequestSerializer(serializers.ModelSerializer):
             'id', 'client', 'client_name', 'service_type', 'service_type_name',
             'description', 'priority', 'status', 'preferred_date',
             'preferred_time_slot', 'scheduling_notes', 'request_date', 'updated_at',
-            'auto_ticket_created', 'location', 'service', 'notes', 'lat', 'lng',
+            'auto_ticket_created', 'location', 'sla', 'service', 'notes', 'lat', 'lng',
             'locationDesc', 'location_address', 'location_city',
             'location_province', 'latitude', 'longitude'
         ]
@@ -244,7 +253,26 @@ class TechnicianSkillSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = TechnicianSkill
-        fields = '__all__'
+        fields = ['id', 'service_type', 'service_type_name', 'skill_level', 'technician_name', 'technician']
+        read_only_fields = ['id', 'technician_name', 'technician']
+    
+    def validate(self, attrs):
+        """Check for duplicate skills"""
+        technician = self.context.get('request').user
+        service_type = attrs.get('service_type')
+        
+        # If updating, allow same skill
+        if self.instance:
+            if self.instance.service_type == service_type and self.instance.technician == technician:
+                return attrs
+        
+        # Check if this skill already exists for this technician
+        if TechnicianSkill.objects.filter(technician=technician, service_type=service_type).exists():
+            raise serializers.ValidationError(
+                f"You already have this skill. Update the existing skill level instead."
+            )
+        
+        return attrs
 
 
 class ServiceStatusHistorySerializer(serializers.ModelSerializer):
@@ -284,6 +312,22 @@ class InspectionChecklistSerializer(serializers.ModelSerializer):
             'proof_media',
             getattr(self.instance, 'proof_media', []),
         )
+        follow_up_required = attrs.get(
+            'follow_up_required',
+            getattr(self.instance, 'follow_up_required', False),
+        )
+        follow_up_case_type = attrs.get(
+            'follow_up_case_type',
+            getattr(self.instance, 'follow_up_case_type', None),
+        )
+        follow_up_due_date = attrs.get(
+            'follow_up_due_date',
+            getattr(self.instance, 'follow_up_due_date', None),
+        )
+        follow_up_summary = attrs.get(
+            'follow_up_summary',
+            getattr(self.instance, 'follow_up_summary', None),
+        )
 
         if maintenance_required and not maintenance_profile:
             raise serializers.ValidationError({
@@ -310,6 +354,31 @@ class InspectionChecklistSerializer(serializers.ModelSerializer):
                 'proof_media': 'Proof media must be provided as a list.',
             })
 
+        if follow_up_required and not follow_up_case_type:
+            raise serializers.ValidationError({
+                'follow_up_case_type': 'Select an after-sales case type when follow-up is required.',
+            })
+
+        if follow_up_required and not follow_up_summary:
+            raise serializers.ValidationError({
+                'follow_up_summary': 'Provide a short handoff summary for the after-sales team.',
+            })
+
+        if follow_up_case_type == 'maintenance':
+            raise serializers.ValidationError({
+                'follow_up_case_type': 'Use the maintenance section instead of creating a maintenance handoff here.',
+            })
+
+        if follow_up_case_type == 'warranty' and not warranty_provided:
+            raise serializers.ValidationError({
+                'follow_up_case_type': 'Warranty follow-up requires warranty coverage to be enabled first.',
+            })
+
+        if follow_up_due_date and follow_up_due_date < timezone.localdate():
+            raise serializers.ValidationError({
+                'follow_up_due_date': 'Follow-up due date cannot be in the past.',
+            })
+
         return attrs
     
     class Meta:
@@ -332,6 +401,8 @@ class ServiceTicketSerializer(serializers.ModelSerializer):
     status_history = ServiceStatusHistorySerializer(many=True, read_only=True)
     inspection = InspectionChecklistSerializer(read_only=True)
     inventory_reservations = serializers.SerializerMethodField()
+    crew_members = serializers.SerializerMethodField()
+    sla = serializers.SerializerMethodField()
 
     def get_inventory_reservations(self, obj):
         return [
@@ -349,6 +420,19 @@ class ServiceTicketSerializer(serializers.ModelSerializer):
             }
             for reservation in obj.inventory_reservations.select_related('item', 'technician').order_by('id')
         ]
+
+    def get_crew_members(self, obj):
+        return [
+            {
+                'id': assignment.technician_id,
+                'username': assignment.technician.username,
+                'name': assignment.technician.get_full_name().strip() or assignment.technician.username,
+            }
+            for assignment in obj.crew_assignments.select_related('technician').order_by('created_at', 'id')
+        ]
+
+    def get_sla(self, obj):
+        return serialize_sla_evaluation(evaluate_service_ticket_sla(obj))
     
     class Meta:
         model = ServiceTicket
@@ -368,6 +452,7 @@ class FollowUpCaseSerializer(serializers.ModelSerializer):
     ticket_completed_date = serializers.DateTimeField(source='service_ticket.completed_date', read_only=True)
     ticket_warranty_status = serializers.CharField(source='service_ticket.warranty_status', read_only=True)
     ticket_warranty_end_date = serializers.DateField(source='service_ticket.warranty_end_date', read_only=True)
+    creation_source_label = serializers.CharField(source='get_creation_source_display', read_only=True)
 
     def get_service_address(self, obj):
         try:
@@ -378,7 +463,7 @@ class FollowUpCaseSerializer(serializers.ModelSerializer):
     class Meta:
         model = FollowUpCase
         fields = '__all__'
-        read_only_fields = ['client', 'created_by', 'resolved_at', 'created_at', 'updated_at']
+        read_only_fields = ['client', 'created_by', 'resolved_at', 'created_at', 'updated_at', 'creation_source']
 
 
 # Auto-assignment serializer
